@@ -1,3 +1,7 @@
+# Agent tooling
+.orca/
+.omp/
+
 # ===== OS =====
 # macOS
 .DS_Store
