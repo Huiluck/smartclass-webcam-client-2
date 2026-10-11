@@ -5,6 +5,15 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["synthetic"]
+# The synthetic test pattern, encoded by a software H.264 encoder. It needs no camera and no
+# permission, which is what makes it the default on a desktop; it is also the one part of the
+# client that does not build for every target (openh264 brings its own x86 assembly), so a
+# build for Android — where a real camera is the point — leaves it off with
+# `--no-default-features`.
+synthetic = ["dep:openh264", "dep:jpeg-encoder"]
+
 [dependencies]
 scwc-capture = { path = "../capture" }
 scwc-core = { path = "../core" }
@@ -14,5 +23,5 @@ tokio = { workspace = true, features = ["signal"] }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-openh264 = { workspace = true }
-jpeg-encoder = { workspace = true }
+openh264 = { workspace = true, optional = true }
+jpeg-encoder = { workspace = true, optional = true }

@@ -1,12 +1,17 @@
 //! Headless device client.
 //!
 //! Registers one camera with a real smartclass-webcam-server, attaches, streams either a
-//! synthetic 4K test pattern encoded by a software H.264 encoder (`--source synthetic`, the
-//! default) or a camera of this machine through the platform capture pipeline
-//! (`--source camera`), and runs until SIGTERM/SIGINT. It is the binary the end-to-end harness
-//! drives; the wire protocol, session and media queue live in [`scwc_core`], the platform
-//! capture pipeline in [`scwc_capture`].
+//! synthetic 4K test pattern encoded by a software H.264 encoder (`--source synthetic`) or a
+//! camera of this machine through the platform capture pipeline (`--source camera`), and runs
+//! until SIGTERM/SIGINT. It is the binary the end-to-end harness drives; the wire protocol,
+//! session and media queue live in [`scwc_core`], the platform capture pipeline in
+//! [`scwc_capture`].
+//!
+//! The synthetic source is behind the `synthetic` feature, which is on by default and off in
+//! the Android build: the software encoder it needs does not build for that target, and a
+//! phone streams its own camera rather than a test pattern.
 
+#[cfg(feature = "synthetic")]
 mod source;
 
 use std::process::ExitCode;
@@ -18,6 +23,7 @@ use scwc_protocol::{CameraRegistration, Codec};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+#[cfg(feature = "synthetic")]
 use crate::source::SynthSource;
 
 /// Capability matrix announced when the capture source reports none of its own.
@@ -31,8 +37,8 @@ const FALLBACK_PRESETS: [(&str, &[u32]); 2] =
 /// The codec choice on the command line.
 ///
 /// The synthetic source only ever encodes H.264: H.265 is accepted so the flag matches the
-/// protocol vocabulary, but that camera is announced as H.264 with a warning. The camera source
-/// honours both, through VideoToolbox.
+/// protocol vocabulary, but that camera is announced as H.264 with a warning. A camera source
+/// honours both, through whichever encoder the platform provides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CodecArg {
     /// H.264/AVC.
@@ -63,6 +69,18 @@ enum SourceArg {
     Camera,
 }
 
+/// The source a run uses when `--source` is omitted.
+///
+/// A build without the synthetic feature has no test pattern to fall back on, so its only
+/// source is the camera — which is also the one a phone build wants.
+fn default_source() -> SourceArg {
+    if cfg!(feature = "synthetic") {
+        SourceArg::Synthetic
+    } else {
+        SourceArg::Camera
+    }
+}
+
 /// Command line of `scwc-cli`.
 #[derive(Debug, Parser)]
 #[command(name = "scwc-cli", version, about, long_about = None)]
@@ -76,9 +94,10 @@ struct Args {
     /// Device bearer token (`wdt_...`).
     #[arg(long, required_unless_present = "list_cameras")]
     token: Option<String>,
-    /// Frame source to stream from.
-    #[arg(long, value_enum, default_value = "synthetic")]
-    source: SourceArg,
+    /// Frame source to stream from; defaults to the test pattern on a build that has one and
+    /// to the camera otherwise.
+    #[arg(long, value_enum)]
+    source: Option<SourceArg>,
     /// Camera to open, by the id `--list-cameras` reports; defaults to the first camera found.
     #[arg(long)]
     camera_id: Option<String>,
@@ -133,7 +152,7 @@ impl Args {
             server: required(self.server, "--server")?,
             device_id: required(self.device_id, "--device-id")?,
             token: required(self.token, "--token")?,
-            source: self.source,
+            source: self.source.unwrap_or_else(default_source),
             camera_id: self.camera_id,
             resolution: required(self.resolution, "--resolution")?,
             fps: required(self.fps, "--fps")?,
@@ -182,9 +201,10 @@ fn parse_resolution(value: &str) -> Result<Resolution, String> {
     if width % 2 != 0 || height % 2 != 0 {
         return Err("resolution sides must be even (I420 chroma is half-resolution)".to_owned());
     }
-    // OpenH264 refuses anything above 3840x2160 in either orientation.
+    // 3840x2160 is the largest capture the client targets on any platform, and the synthetic
+    // source's software encoder refuses anything above it in either orientation.
     if width.max(height) > 3840 || width.min(height) > 2160 {
-        return Err("resolution exceeds the encoder's 3840x2160 limit".to_owned());
+        return Err("resolution exceeds the 3840x2160 maximum the client captures".to_owned());
     }
 
     Ok(Resolution { width, height })
@@ -208,12 +228,22 @@ async fn main() -> ExitCode {
 
     let source = args.source;
     match source {
+        #[cfg(feature = "synthetic")]
         SourceArg::Synthetic => run_synthetic(args).await,
+        #[cfg(not(feature = "synthetic"))]
+        SourceArg::Synthetic => {
+            error!(
+                "this build has no synthetic source: the software encoder is desktop-only; \
+                 stream a camera with --source camera"
+            );
+            ExitCode::from(2)
+        }
         SourceArg::Camera => run_camera(args).await,
     }
 }
 
 /// Builds the synthetic test pattern and registers it as the only camera.
+#[cfg(feature = "synthetic")]
 async fn run_synthetic(args: RunArgs) -> ExitCode {
     if args.codec == CodecArg::H265 {
         warn!(
