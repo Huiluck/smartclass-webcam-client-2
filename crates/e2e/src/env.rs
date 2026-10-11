@@ -123,6 +123,7 @@ impl TestEnv {
             fps,
             bitrate_kbps,
             codec,
+            extra_args: Vec::new(),
         };
         let log = self.run_dir().join(format!("client-{}.log", self.unique));
         spawn_cli(binary, &options, &log)

@@ -1,0 +1,22 @@
+[package]
+name = "scwc-capture"
+description = "Camera capture and hardware encoding for the SmartClass Webcam protocol: enumerates devices and feeds encoded frames into scwc-core's media path"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+scwc-core = { path = "../core" }
+scwc-protocol = { path = "../protocol" }
+
+tokio = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+clap = { workspace = true }
+tracing-subscriber = { workspace = true }

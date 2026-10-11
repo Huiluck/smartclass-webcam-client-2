@@ -1,0 +1,113 @@
+//! Camera capture and encoding for the SmartClass Webcam protocol.
+//!
+//! This crate is the platform half of the device client: it lists the cameras of the host
+//! ([`enumerate_cameras`]), opens one of them ([`open`]) and hands the resulting
+//! [`CaptureSource`] to [`scwc_core`], which drives it as a
+//! [`FrameSource`](scwc_core::FrameSource) — pulls encoded frames, reconfigures the
+//! pipeline on `switch_camera` and asks for stills on `take_photo`.
+//!
+//! # Backends
+//!
+//! - **macOS**: AVFoundation for capture, VideoToolbox for encoding, both driven by an
+//!   Objective-C++ shim compiled by this crate's build script. Frames leave the encoder as
+//!   Annex B access units with parameter sets in front of every IDR, which is what the
+//!   server's H.264/H.265 consumers expect.
+//! - **Everything else**: [`enumerate_cameras`] and [`open`] fail with
+//!   [`CaptureError::Os`]; the crate still compiles so that the rest of the workspace can
+//!   be built and tested on any host.
+//!
+//! # Frame pacing
+//!
+//! Encoded frames travel from the encoder callback into a bounded channel of
+//! [`MEDIA_QUEUE_CAPACITY`](scwc_core::MEDIA_QUEUE_CAPACITY) entries. When it is full, delta
+//! frames are dropped and keyframes wait for space, mirroring the core's own drop policy:
+//! a decoder can always recover at the next IDR, but a dropped IDR costs a whole GOP.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use scwc_capture::{CaptureConfig, enumerate_cameras, open};
+//! use scwc_protocol::Codec;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let cameras = enumerate_cameras()?;
+//! let camera = cameras.first().ok_or("no camera")?;
+//! let source = open(CaptureConfig {
+//!     camera_id: Some(camera.id.clone()),
+//!     width: 3840,
+//!     height: 2160,
+//!     fps: 30,
+//!     codec: Codec::H264,
+//!     bitrate_kbps: 20_000,
+//! })?;
+//! # let _ = source;
+//! # Ok(())
+//! # }
+//! ```
+
+#![warn(missing_docs)]
+
+mod error;
+mod source;
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos as sys;
+
+#[cfg(not(target_os = "macos"))]
+mod unsupported;
+#[cfg(not(target_os = "macos"))]
+use unsupported as sys;
+
+pub use crate::error::CaptureError;
+pub use crate::source::{CaptureSource, open};
+
+/// Lists the cameras of the host.
+///
+/// Each camera reports the resolutions and frame rates its own format descriptors
+/// announce, highest resolution and highest frame rate first. Nothing here starts a
+/// capture session: this is the cheap listing an operator picks a camera from and the raw
+/// material for a launch-time validation pass, which is a separate step because vendors
+/// misreport what their hardware can stream.
+///
+/// Fails with [`CaptureError::NoCamera`] when the host has no video device and with
+/// [`CaptureError::PermissionDenied`] when the process may not use the camera.
+pub fn enumerate_cameras() -> Result<Vec<CameraInfo>, CaptureError> {
+    sys::enumerate_cameras()
+}
+
+/// One camera of the host, as reported by the platform backend.
+///
+/// `presets` maps a resolution string (`"3840x2160"`) to the frame rates the device
+/// announces for it, highest first. The list comes from the device's own format
+/// descriptors, so it is a *claim*: the platform can accept a format it cannot actually
+/// stream. The planned launch-time validation — creating a session per candidate pair and
+/// keeping only what works — attaches its results to the same structure, which is why the
+/// presets are a plain matrix rather than pre-flattened registration lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CameraInfo {
+    /// Stable device identifier (AVFoundation `uniqueID` on macOS).
+    pub id: String,
+    /// Human-readable device name.
+    pub name: String,
+    /// Announced `(resolution, frame rates)` pairs, largest resolution first.
+    pub presets: Vec<(String, Vec<u32>)>,
+}
+
+/// What [`open`] should capture and how it should encode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureConfig {
+    /// Device identifier from [`CameraInfo::id`]; `None` selects the system default camera.
+    pub camera_id: Option<String>,
+    /// Requested capture width in pixels.
+    pub width: u32,
+    /// Requested capture height in pixels.
+    pub height: u32,
+    /// Requested capture frame rate.
+    pub fps: u32,
+    /// Codec the hardware encoder produces.
+    pub codec: scwc_protocol::Codec,
+    /// Target encoder bitrate in kilobits per second.
+    pub bitrate_kbps: u32,
+}

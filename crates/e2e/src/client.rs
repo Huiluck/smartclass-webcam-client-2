@@ -26,6 +26,8 @@ pub struct ClientOptions<'a> {
     pub bitrate_kbps: u32,
     /// Optional codec override.
     pub codec: Option<&'a str>,
+    /// Additional CLI flags appended verbatim (e.g. `--source camera`).
+    pub extra_args: Vec<String>,
 }
 
 /// Build `scwc-cli` in the workspace and return the path of the produced binary.
@@ -104,6 +106,7 @@ pub fn spawn_cli(binary: &Path, options: &ClientOptions<'_>, log: &Path) -> Resu
     if let Some(codec) = options.codec {
         command.arg("--codec").arg(codec);
     }
+    command.args(&options.extra_args);
     command
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
