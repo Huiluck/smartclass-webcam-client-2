@@ -1,0 +1,110 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# All action references are pinned to a commit SHA; the comment carries the version.
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-windows:
+    # One Ubuntu runner builds both the native Linux target and the Windows
+    # target (cross via cargo-xwin: clang-cl + the MSVC SDK fetched by xwin,
+    # no Windows runner/container needed).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust (stable + windows-msvc target)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add x86_64-pc-windows-msvc
+
+      - name: Install Linux system deps (VAAPI headers; llvm/clang/lld for the Windows cross)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libva-dev clang lld
+          # ring's cc build needs an unversioned llvm-lib (MSVC lib.exe equivalent);
+          # the image only ships versioned names. Regex excludes llvm-libtool-darwin.
+          sudo ln -sf "$(find /usr/bin /usr/lib -regex '.*/llvm-lib-[0-9]+' -print 2>/dev/null | sort -V | tail -n1)" /usr/local/bin/llvm-lib
+
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+
+      # Cache the cargo-xwin binary and the xwin MSVC SDK (~1.5 GB unpacked) so
+      # it is fetched once per version, not per run. The repo cache budget is
+      # 10 GB; this plus the rust caches stays well below it.
+      - name: Cache cargo-xwin + xwin SDK
+        id: xwin-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-xwin
+            ~/.cache/xwin
+          key: xwin-0.23.1-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install cargo-xwin (static musl binary)
+        if: steps.xwin-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -sSfL https://github.com/rust-cross/cargo-xwin/releases/download/v0.23.1/cargo-xwin-v0.23.1.x86_64-unknown-linux-musl.tar.gz | tar xz
+          install -m755 cargo-xwin ~/.cargo/bin/cargo-xwin
+
+      - name: Download the MSVC SDK (xwin splat)
+        # The SDK download (~1.5 GB from Microsoft's servers) runs in its own
+        # step so it shows progress and lands in the cache even if a later
+        # build step fails.
+        if: steps.xwin-cache.outputs.cache-hit != 'true'
+        run: |
+          cargo new /tmp/xwin-warm --bin
+          cd /tmp/xwin-warm
+          cargo xwin check --target x86_64-pc-windows-msvc
+
+      - name: Build workspace (Linux)
+        run: cargo build --workspace --examples --locked
+
+      - name: Unit tests (Linux)
+        # scwc-e2e is excluded: its tests boot PostgreSQL + the server and are
+        # exercised on developer machines, not here.
+        run: cargo test --workspace --exclude scwc-e2e --locked
+
+      - name: Build workspace (Windows, cross)
+        run: cargo xwin build --workspace --target x86_64-pc-windows-msvc --locked
+
+  apple:
+    # macOS and iOS require the Apple SDKs; there is no legal/practical cross
+    # path, so this one job uses a macOS runner.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust (stable + iOS target)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-apple-ios
+
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+
+      - name: Build workspace (macOS)
+        run: cargo build --workspace --examples --locked
+
+      - name: Check capture backend (iOS)
+        run: cargo check -p scwc-capture --target aarch64-apple-ios --locked
+
+      - name: Unit tests (macOS)
+        run: cargo test --workspace --exclude scwc-e2e --locked
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          channel: stable
+          cache: true
+
+      - name: Build Flutter app (macOS)
+        run: flutter build macos --debug
+        working-directory: app
+
+  # TODO(android): add the Android capture backend (Camera2 + MediaCodec) first,
+  # then extend this workflow with an aarch64-linux-android cargo check and a
+  # `flutter build apk --debug` step in the apple job (or a dedicated job).
