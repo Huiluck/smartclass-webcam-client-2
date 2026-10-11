@@ -45,7 +45,7 @@ jobs:
         if: steps.xwin-cache.outputs.cache-hit != 'true'
         run: |
           curl -sSfL https://github.com/rust-cross/cargo-xwin/releases/download/v0.23.1/cargo-xwin-v0.23.1.x86_64-unknown-linux-musl.tar.gz | tar xz
-          install -m755 cargo-xwin-v0.23.1.x86_64-unknown-linux-musl/cargo-xwin ~/.cargo/bin/cargo-xwin
+          install -m755 cargo-xwin ~/.cargo/bin/cargo-xwin
 
       - name: Build workspace (Linux)
         run: cargo build --workspace --examples --locked
