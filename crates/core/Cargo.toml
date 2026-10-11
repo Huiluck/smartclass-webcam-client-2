@@ -1,0 +1,21 @@
+[package]
+name = "scwc-core"
+description = "Device-client core for the SmartClass Webcam protocol: registration, session, control and media"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+scwc-protocol = { path = "../protocol" }
+
+tokio = { workspace = true, features = ["net"] }
+# The TLS feature is required for `wss://`; without it `connect_async` refuses secure URLs.
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+reqwest = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

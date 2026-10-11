@@ -46,6 +46,20 @@ buffers with timestamps — while the protocol, networking and framing logic liv
 - **Multi-camera**: register all cameras, capture exactly one at a time (the protocol's
   model); `switch_camera` moves the single capture pipeline. No concurrent multi-streaming.
 - **UI shell**: Flutter + `flutter_rust_bridge` over the Rust core's C ABI.
+- **Camera capability probing**: on first launch, enumerate each camera's supported
+  resolution/fps matrix (Camera2 `StreamConfigurationMap` min-frame-duration per size on
+  Android; `AVCaptureDevice.formats` frame-rate ranges on iOS/macOS), then validate every
+  candidate pair by actually creating a capture session (vendors misreport). The verified
+  matrix is persisted (keyed by camera unique id) and reused on subsequent launches without
+  re-probing; a re-verify option (CLI flag / UI action) forces full enumeration+validation
+  again. The registration lists always come from the verified cache.
+- **FFI linking strategy**: the core crate builds as `crate-type = ["staticlib", "cdylib",
+  "rlib"]`. iOS/macOS/Windows/Linux link the core **statically** (`.a`/`.lib` into the app or
+  runner binary via podspec/CMake); Android is the exception — dart:ffi can only load shared
+  libraries, so Android ships `libscwc_core.so` in `jniLibs/<abi>/`. Bindings via
+  flutter_rust_bridge v2 (async events over FRB streams / Dart_PostCObject). All dependencies
+  are pure Rust + rustls, so static linking carries no GPL or dynamic-runtime baggage; the
+  openh264 dependency is M1-only and must not leak into the production core.
 
 ### Still open
 

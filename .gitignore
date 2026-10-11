@@ -2,6 +2,9 @@
 .orca/
 .omp/
 
+# E2E harness cache (downloaded server source/binary, PostgreSQL, run state, media)
+.cache/
+
 # ===== OS =====
 # macOS
 .DS_Store
