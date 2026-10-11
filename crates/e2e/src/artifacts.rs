@@ -23,29 +23,96 @@ pub const SERVER_TAG: &str = "v0.3.1";
 /// PostgreSQL version used as the server's database.
 pub const PG_VERSION: &str = "18.6.0";
 
-/// Target triple of the PostgreSQL distribution; the harness currently ships darwin/arm64 only.
-pub const PG_TARGET: &str = "aarch64-apple-darwin";
+/// Target triple of the PostgreSQL distribution to fetch for this host, when one is published.
+///
+/// The binaries are single-platform builds published per Rust target triple, so the harness has
+/// to ask for the one it is running on: a host without a published build is refused up front,
+/// rather than by a download that 404s halfway through bring-up.
+pub fn pg_target() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
+        ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
+        ("windows", "x86_64") => Some("x86_64-pc-windows-msvc"),
+        _ => None,
+    }
+}
+
+/// Why this host cannot run the harness, for the one place that reports it.
+fn unsupported_host() -> anyhow::Error {
+    anyhow::anyhow!(
+        "no PostgreSQL build is published for {}/{}; \
+         the harness can drive the server on macOS, Linux and Windows x86_64",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
+
+/// URL of the PostgreSQL archive for the harness target.
+pub fn pg_archive_url() -> Result<String> {
+    let target = pg_target().ok_or_else(unsupported_host)?;
+    Ok(format!(
+        "https://github.com/theseus-rs/postgresql-binaries/releases/download/{PG_VERSION}/postgresql-{PG_VERSION}-{target}.tar.gz"
+    ))
+}
+
+/// Directory name the PostgreSQL archive extracts to.
+fn pg_dir_name() -> Result<String> {
+    Ok(format!(
+        "postgresql-{PG_VERSION}-{}",
+        pg_target().ok_or_else(unsupported_host)?
+    ))
+}
 
 /// Name of the marker file that keys extraction/build artifacts to their source version.
 const STAMP_FILE: &str = ".scwc-e2e-stamp";
 
-/// URL of the PostgreSQL archive for the harness target.
-pub fn pg_archive_url() -> String {
-    format!(
-        "https://github.com/theseus-rs/postgresql-binaries/releases/download/{PG_VERSION}/postgresql-{PG_VERSION}-{PG_TARGET}.tar.gz"
-    )
+/// The file name a program has on this host.
+///
+/// Windows appends `.exe` to the binaries this workspace builds and to the PostgreSQL tools
+/// alike; naming them without a suffix everywhere and adding it here keeps that one fact in one
+/// place instead of in every path the harness builds.
+pub fn program_name(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    }
 }
 
-/// Directory name the PostgreSQL archive extracts to.
-fn pg_dir_name() -> String {
-    format!("postgresql-{PG_VERSION}-{PG_TARGET}")
+/// The file name of `initdb` on this host.
+fn initdb_binary() -> String {
+    program_name("initdb")
 }
 
 /// Absolute path of the workspace root (the directory holding `.cache`).
+///
+/// The path is canonicalized and then stripped of the Windows verbatim prefix, because every
+/// path the harness hands to an external program — `git`, `cargo`, `tar`, the PostgreSQL tools —
+/// is derived from this one, and those programs reject the verbatim form.
 pub fn workspace_root() -> Result<PathBuf> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let root = manifest.join("..").join("..");
-    fs::canonicalize(&root).with_context(|| format!("resolving workspace root {}", root.display()))
+    let root = fs::canonicalize(&root)
+        .with_context(|| format!("resolving workspace root {}", root.display()))?;
+    Ok(strip_verbatim(root))
+}
+
+/// Removes the `\\?\` prefix `fs::canonicalize` puts on Windows paths.
+///
+/// The prefix is what makes a canonical path immune to `MAX_PATH` and to further normalization;
+/// it is also what tools outside Rust refuse to open. `\\?\UNC\server\share` becomes the plain
+/// `\\server\share` it stands for.
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => PathBuf::from(rest),
+        None => path,
+    }
 }
 
 /// Paths under `<workspace>/.cache` the harness reads and writes.
@@ -94,12 +161,12 @@ impl CachePaths {
 
     /// The compiled server binary.
     pub fn server_bin(&self) -> PathBuf {
-        self.bin_dir().join("smartclass-webcam-server")
+        self.bin_dir().join(program_name("smartclass-webcam-server"))
     }
 
     /// The `bin/` directory of the extracted PostgreSQL distribution.
-    pub fn pg_bin_dir(&self) -> PathBuf {
-        self.services_dir().join(pg_dir_name()).join("bin")
+    pub fn pg_bin_dir(&self) -> Result<PathBuf> {
+        Ok(self.services_dir().join(pg_dir_name()?).join("bin"))
     }
 
     /// Create every cache directory the harness uses.
@@ -121,13 +188,9 @@ impl CachePaths {
 ///
 /// Safe to call repeatedly: the second call is a few file-existence checks.
 pub async fn ensure_artifacts() -> Result<CachePaths> {
-    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        bail!(
-            "the e2e harness ships a darwin/arm64 PostgreSQL build only; \
-             host is {}-{}",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        );
+    // Refuses a host with no published PostgreSQL build before anything is downloaded.
+    if pg_target().is_none() {
+        return Err(unsupported_host());
     }
 
     let paths = CachePaths::discover()?;
@@ -177,28 +240,40 @@ pub async fn fetch_cached(client: &reqwest::Client, dir: &Path, url: &str) -> Re
     Ok(dest)
 }
 
+/// Pulls the SHA-256 digest out of a checksum sidecar.
+///
+/// The sidecars are generated per platform, so their shape differs: the Unix builds publish
+/// `<digest>  <file>`, and the Windows one is the output of `certutil -hashfile`, which prints a
+/// sentence, the digest, and another sentence. What they have in common is exactly one
+/// 64-character hexadecimal token, which is what this looks for rather than trusting a position
+/// in the text.
+fn checksum_digest(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .map(|token| token.trim_end_matches(':'))
+        .find(|token| token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
+}
+
 /// Ensure the PostgreSQL distribution is extracted and return its `bin/` directory.
 async fn ensure_postgres(paths: &CachePaths, client: &reqwest::Client) -> Result<PathBuf> {
-    let dir = paths.services_dir().join(pg_dir_name());
-    let initdb = dir.join("bin").join("initdb");
-    if initdb.exists() && stamp_matches(&dir, &pg_dir_name()) {
+    let dir_name = pg_dir_name()?;
+    let dir = paths.services_dir().join(&dir_name);
+    let initdb = dir.join("bin").join(initdb_binary());
+    if initdb.exists() && stamp_matches(&dir, &dir_name) {
         return Ok(dir.join("bin"));
     }
 
-    let archive_url = pg_archive_url();
+    let archive_url = pg_archive_url()?;
     let archive = fetch_cached(client, &paths.downloads_dir(), &archive_url).await?;
     let sidecar_url = format!("{archive_url}.sha256");
     let sidecar = fetch_cached(client, &paths.downloads_dir(), &sidecar_url).await?;
 
     let sidecar_text = fs::read_to_string(&sidecar)
         .with_context(|| format!("reading {}", sidecar.display()))?;
-    let expected = sidecar_text
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let expected = checksum_digest(&sidecar_text)
+        .ok_or_else(|| anyhow::anyhow!("no SHA-256 digest in {}", sidecar.display()))?;
     let actual = sha256_file(&archive)?;
-    if expected.is_empty() || expected != actual {
+    if expected != actual {
         bail!("PostgreSQL archive checksum mismatch: expected {expected:?}, got {actual}");
     }
 
@@ -226,7 +301,7 @@ async fn ensure_postgres(paths: &CachePaths, client: &reqwest::Client) -> Result
         );
     }
 
-    write_stamp(&dir, &pg_dir_name())?;
+    write_stamp(&dir, &dir_name)?;
     Ok(dir.join("bin"))
 }
 
@@ -256,12 +331,21 @@ fn ensure_server(paths: &CachePaths) -> Result<PathBuf> {
     }
 
     info!("building the server binary");
+    // The module and build caches are pointed into the harness cache rather than left at the
+    // toolchain's default under the user's home: that directory is not necessarily writable by
+    // the process running the tests, and a cache inside `.cache` is removed with the rest of the
+    // harness state.
+    let go_cache = paths.root().join("go");
+    fs::create_dir_all(&go_cache)
+        .with_context(|| format!("creating {}", go_cache.display()))?;
     let output = Command::new("go")
         .arg("build")
         .arg("-o")
         .arg(&bin)
         .arg("./cmd/server")
         .current_dir(&src)
+        .env("GOMODCACHE", go_cache.join("mod"))
+        .env("GOCACHE", go_cache.join("build"))
         .output()
         .context("running go (is it on PATH?)")?;
     if !output.status.success() {

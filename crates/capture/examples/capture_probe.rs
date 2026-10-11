@@ -82,6 +82,13 @@ struct Args {
     /// How long to capture for.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..), default_value_t = 10)]
     seconds: u64,
+    /// How long to wait for the first frame before giving up.
+    ///
+    /// The default suits a camera that takes its time to start, which is what a remote or
+    /// virtual camera on a desktop does; a platform whose pipeline either delivers within a
+    /// second or never does — Android is one — is much faster to debug with a short one.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..), default_value_t = 60)]
+    first_frame_timeout: u64,
     /// Codec the hardware encoder produces.
     #[arg(long, value_enum, default_value = "h264")]
     codec: CodecArg,
@@ -232,10 +239,14 @@ async fn main() -> ExitCode {
     // phone-as-webcam) can take tens of seconds to deliver after the session opens, so the
     // measurement window begins at the first frame, not at open().
     let opened = Instant::now();
-    let first = match timeout(Duration::from_secs(60), source.next_frame()).await {
+    let first_frame_timeout = Duration::from_secs(args.first_frame_timeout);
+    let first = match timeout(first_frame_timeout, source.next_frame()).await {
         Ok(frame) => frame,
         Err(_) => {
-            eprintln!("no frame within 60s of opening the camera (device never started?)");
+            eprintln!(
+                "no frame within {}s of opening the camera (device never started?)",
+                args.first_frame_timeout
+            );
             return ExitCode::FAILURE;
         }
     };

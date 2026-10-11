@@ -46,7 +46,7 @@ impl TestEnv {
         let paths = Self::ensure().await?;
         let unique = unique_id();
         let postgres = Postgres::start(
-            paths.pg_bin_dir(),
+            paths.pg_bin_dir()?,
             &paths.run_dir(),
             &unique,
             PREFERRED_PG_PORT,

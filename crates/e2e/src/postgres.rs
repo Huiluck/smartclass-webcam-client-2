@@ -6,6 +6,8 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use tracing::info;
 
+use crate::artifacts::program_name;
+
 /// A running PostgreSQL instance owned by one test environment.
 ///
 /// Dropping it runs `pg_ctl -m immediate stop`, so no postmaster outlives the test. The data
@@ -42,7 +44,7 @@ impl Postgres {
             .with_context(|| format!("creating {}", socket_dir.display()))?;
 
         info!(data = %data_dir.display(), "initialising PostgreSQL");
-        let output = Command::new(pg_bin.join("initdb"))
+        let output = Command::new(pg_bin.join(program_name("initdb")))
             .arg("-D")
             .arg(&data_dir)
             .arg("-U")
@@ -64,7 +66,7 @@ impl Postgres {
             socket_dir.display()
         );
         info!(port, "starting PostgreSQL");
-        let output = Command::new(pg_bin.join("pg_ctl"))
+        let output = Command::new(pg_bin.join(program_name("pg_ctl")))
             .arg("start")
             .arg("-D")
             .arg(&data_dir)
@@ -87,7 +89,7 @@ impl Postgres {
         }
 
         info!("creating the webcam database");
-        let output = Command::new(pg_bin.join("createdb"))
+        let output = Command::new(pg_bin.join(program_name("createdb")))
             .arg("-h")
             .arg("127.0.0.1")
             .arg("-p")
@@ -141,7 +143,7 @@ impl Drop for Postgres {
 }
 
 fn pg_ctl(bin: &Path, data_dir: &Path, log: &Path, action: &[&str]) -> Result<()> {
-    let output = Command::new(bin.join("pg_ctl"))
+    let output = Command::new(bin.join(program_name("pg_ctl")))
         .arg("-D")
         .arg(data_dir)
         .arg("-l")

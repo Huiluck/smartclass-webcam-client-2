@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use tracing::info;
 
-use crate::artifacts::workspace_root;
+use crate::artifacts::{program_name, workspace_root};
 use crate::process::ChildGuard;
 
 /// Arguments passed to `scwc-cli` for one test run.
@@ -72,7 +72,7 @@ pub fn build_cli() -> Result<PathBuf> {
         );
     }
 
-    let binary = target_dir.join("debug").join("scwc-cli");
+    let binary = target_dir.join("debug").join(program_name("scwc-cli"));
     if !binary.exists() {
         bail!(
             "cargo build -p scwc-cli succeeded but no binary is at {}",

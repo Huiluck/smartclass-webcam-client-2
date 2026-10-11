@@ -23,7 +23,13 @@
 //!   compiled. Hardware encoders (NVENC, Quick Sync, AMF) are preferred and the inbox
 //!   software H.264 encoder is the loud fallback. See the `windows` module for the
 //!   behaviours that hardware testing still has to confirm.
-//! - **Everything else** (Android among them): [`enumerate_cameras`] and [`open`] fail with
+//! - **Android**: the Camera2 NDK for capture and `AMediaCodec` for encoding, both reached
+//!   through hand-written FFI like the Linux backend, so no shim is compiled either.
+//!   Enumeration reports each camera's real capability matrix; the capture session and the
+//!   encoder are still being built (see the `android` module for the exact state). The
+//!   `CAMERA` permission is held per process on this platform, so a run from `adb shell`
+//!   is refused where an installed app succeeds.
+//! - **Everything else**: [`enumerate_cameras`] and [`open`] fail with
 //!   [`CaptureError::Os`]; the crate still compiles so that the rest of the workspace can
 //!   be built and tested on any host.
 //!
@@ -83,6 +89,7 @@
 
 #![warn(missing_docs)]
 
+mod camera_matrix;
 mod error;
 mod source;
 
@@ -101,18 +108,25 @@ mod windows;
 #[cfg(target_os = "windows")]
 use windows as sys;
 
+#[cfg(target_os = "android")]
+mod android;
+#[cfg(target_os = "android")]
+use android as sys;
+
 #[cfg(not(any(
     target_os = "macos",
     target_os = "ios",
     target_os = "linux",
-    target_os = "windows"
+    target_os = "windows",
+    target_os = "android"
 )))]
 mod unsupported;
 #[cfg(not(any(
     target_os = "macos",
     target_os = "ios",
     target_os = "linux",
-    target_os = "windows"
+    target_os = "windows",
+    target_os = "android"
 )))]
 use unsupported as sys;
 

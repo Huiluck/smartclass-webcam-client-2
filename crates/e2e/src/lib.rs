@@ -37,7 +37,7 @@ mod server;
 
 pub use api::{Device, DeviceCredentials, ManagementApi, Segment, Stream};
 pub use artifacts::{
-    CachePaths, PG_TARGET, PG_VERSION, SERVER_TAG, ensure_artifacts, pg_archive_url,
+    CachePaths, PG_VERSION, SERVER_TAG, ensure_artifacts, pg_archive_url, pg_target, program_name,
     workspace_root,
 };
 pub use client::{ClientOptions, ClientProcess, build_cli, spawn_cli};
