@@ -1,6 +1,10 @@
 //
 // Objective-C++ shim: AVFoundation capture and VideoToolbox encoding for `scwc-capture`.
 //
+// One shim serves both Apple platforms, because AVFoundation and VideoToolbox are the same
+// APIs on macOS and iOS: what differs — device discovery, session presets, the interruptions
+// and thermal pressure an iOS app has to live with — sits behind `TARGET_OS_IPHONE`.
+//
 // The shim owns every platform object behind an opaque handle. Rust never sees an
 // Objective-C type: it calls the entry points at the bottom of this file and receives
 // Annex B access units and JPEG stills through the callbacks it registers.
@@ -8,6 +12,10 @@
 // Layout note: the class is declared first so the helpers below can message it, and the
 // helpers come before the implementation that uses them.
 //
+
+// `TARGET_OS_IPHONE` splits the two platforms in this file; what is macOS-only sits in its
+// `#else`, so the macOS path is what it has always been.
+#include <TargetConditionals.h>
 
 #import <AVFoundation/AVFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -41,8 +49,14 @@
   std::mutex _photoLock;
   std::mutex _photoInFlight;
   std::mutex _callbackLock;
+  /// Guards `_session`. The iOS notification blocks below run on the thread that posted the
+  /// notification, which is not the thread that tears the pipeline down; everything that
+  /// touches `_session` from there goes through this lock.
+  std::mutex _sessionLock;
   scwc_mac_frame_cb _frameCallback;
   void *_frameUser;
+  scwc_mac_status_cb _statusCallback;
+  void *_statusUser;
   int32_t _codec;
   uint32_t _width;
   uint32_t _height;
@@ -50,6 +64,14 @@
   uint32_t _bitrateKbps;
   std::string _cameraId;
   bool _shutDown;
+#if TARGET_OS_IPHONE
+  /// Notification tokens, kept so `teardown` can cancel the subscriptions.
+  id _thermalObserver;
+  id _interruptionObserver;
+  id _interruptionEndedObserver;
+  /// The last thermal state reported to Rust, so only transitions are logged.
+  int32_t _lastThermalState;
+#endif
 }
 - (int32_t)startWithConfig:(const scwc_mac_config *)cfg
               frameCallback:(scwc_mac_frame_cb)callback
@@ -61,6 +83,18 @@
         bitrateKbps:(uint32_t)bitrate;
 - (int32_t)takePhotoWithCallback:(scwc_mac_jpeg_cb)callback user:(void *)user;
 - (void)shutdown;
+/// Publishes the device status callback `scwc_mac_set_status_cb` registers.
+- (void)setStatusCallback:(scwc_mac_status_cb)callback user:(void *)user;
+/// Subscribes to the notifications that report thermal pressure and session interruptions.
+- (void)subscribeNotifications;
+/// Cancels those subscriptions; afterwards no notification block reaches this object again.
+- (void)unsubscribeNotifications;
+#if TARGET_OS_IPHONE
+/// Logs one thermal transition and forwards it to Rust.
+- (void)reportThermalState:(int32_t)state;
+/// Restarts the session an interruption ended on.
+- (void)resumeAfterInterruption:(AVCaptureSession *)session;
+#endif
 /// Flattens one encoded sample into an Annex B access unit and hands it to Rust.
 - (void)handleEncodedSample:(CMSampleBufferRef)sample status:(OSStatus)status;
 @end
@@ -128,6 +162,10 @@ bool format_matches(AVCaptureDeviceFormat *format, uint32_t width, uint32_t heig
 }
 
 /// The first format with the requested dimensions that reaches the requested rate.
+///
+/// iPhone 8 and later advertise 3840x2160@60 among their formats, so 4K60 needs no special
+/// case on iOS: this same search finds it. (Unverified on hardware — the iOS simulator has
+/// no camera — as is the rest of the iOS path.)
 AVCaptureDeviceFormat *pick_format(AVCaptureDevice *device, uint32_t width, uint32_t height,
                                    uint32_t fps) {
   for (AVCaptureDeviceFormat *format in device.formats) {
@@ -176,6 +214,16 @@ CMTime frame_duration(AVCaptureDeviceFormat *format, uint32_t fps) {
 /// Every video device of the host, built-in and external.
 NSArray<AVCaptureDevice *> *video_devices() {
   NSMutableArray<AVCaptureDeviceType> *types = [NSMutableArray array];
+#if TARGET_OS_IPHONE
+  // iOS exposes the camera cluster as separate devices: the physical cameras an iPhone
+  // carries, of which a given model has one to three. Asking for a type the device does not
+  // have simply yields no device for it.
+  [types addObject:AVCaptureDeviceTypeBuiltInWideAngleCamera];
+  if (@available(iOS 13.0, *)) {
+    [types addObject:AVCaptureDeviceTypeBuiltInUltraWideCamera];
+  }
+  [types addObject:AVCaptureDeviceTypeBuiltInTelephotoCamera];
+#else
   [types addObject:AVCaptureDeviceTypeBuiltInWideAngleCamera];
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
   if (@available(macOS 14.0, *)) {
@@ -192,12 +240,37 @@ NSArray<AVCaptureDevice *> *video_devices() {
   [types addObject:AVCaptureDeviceTypeExternalUnknown];
 #pragma clang diagnostic pop
 #endif
+#endif
 
   AVCaptureDeviceDiscoverySession *session = [AVCaptureDeviceDiscoverySession
       discoverySessionWithDeviceTypes:types
                             mediaType:AVMediaTypeVideo
                              position:AVCaptureDevicePositionUnspecified];
   return session.devices;
+}
+
+/// The name this shim reports for `device`.
+///
+/// macOS names its cameras after the hardware. iOS calls every built-in camera "Camera", so
+/// the position is what tells them apart in a camera list; it goes into the name here rather
+/// than into a field of its own, because the protocol's camera list is just (id, name).
+NSString *device_name(AVCaptureDevice *device) {
+#if TARGET_OS_IPHONE
+  NSString *position = @"Unspecified";
+  switch (device.position) {
+    case AVCaptureDevicePositionFront:
+      position = @"Front";
+      break;
+    case AVCaptureDevicePositionBack:
+      position = @"Back";
+      break;
+    default:
+      break;
+  }
+  return [NSString stringWithFormat:@"%@ (%@)", device.localizedName, position];
+#else
+  return device.localizedName;
+#endif
 }
 
 /// The camera the system picks when no id was requested.
@@ -210,8 +283,11 @@ AVCaptureDevice *default_device() {
 
 /// Camera permission, requesting it once when the process has not decided yet.
 ///
-/// A CLI process inherits the permission of the terminal that launched it, so a denial here
-/// means the invoking application lacks the camera entitlement.
+/// A macOS CLI process inherits the permission of the terminal that launched it, so a denial
+/// here means the invoking application lacks the camera entitlement. On iOS the request only
+/// reaches the user at all when the host app's `Info.plist` declares
+/// `NSCameraUsageDescription`; without that key the system terminates the process instead of
+/// asking, so the shim cannot report that case as a failure.
 int32_t ensure_video_access() {
   AVAuthorizationStatus status =
       [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
@@ -234,11 +310,20 @@ int32_t ensure_video_access() {
                          ? @"denied"
                          : status == AVAuthorizationStatusRestricted ? @"restricted"
                                                                      : @"not granted";
+#if TARGET_OS_IPHONE
+  return fail(SCWC_MAC_ERR_PERMISSION,
+              [NSString stringWithFormat:@"camera access is %@ for this app; the host app must "
+                                         @"declare NSCameraUsageDescription in its Info.plist "
+                                         @"and grant camera access in Settings > Privacy & "
+                                         @"Security > Camera",
+                                         reason]);
+#else
   return fail(SCWC_MAC_ERR_PERMISSION,
               [NSString stringWithFormat:@"camera access is %@ for this process; grant it in "
                                          @"System Settings > Privacy & Security > Camera for "
                                          @"the application that launched it",
                                          reason]);
+#endif
 }
 
 /// Converts an AVCC sample to Annex B, prepending parameter sets in front of a keyframe.
@@ -327,6 +412,9 @@ bool sample_is_keyframe(CMSampleBufferRef sample) {
 }
 
 /// Encodes one captured frame as JPEG.
+///
+/// The buffer comes straight off the capture connection, so the still is as the sensor
+/// produced it: nothing rotates it here (see `captureOutput:didOutputSampleBuffer:…`).
 NSData *encode_jpeg(CVPixelBufferRef pixel_buffer) {
   @autoreleasepool {
     CVPixelBufferLockBaseAddress(pixel_buffer, kCVPixelBufferLock_ReadOnly);
@@ -397,12 +485,21 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
     _latestPixelBuffer = NULL;
     _frameCallback = NULL;
     _frameUser = NULL;
+    _statusCallback = NULL;
+    _statusUser = NULL;
     _codec = 0;
     _width = 0;
     _height = 0;
     _fps = 0;
     _bitrateKbps = 0;
     _shutDown = false;
+#if TARGET_OS_IPHONE
+    _thermalObserver = nil;
+    _interruptionObserver = nil;
+    _interruptionEndedObserver = nil;
+    // No state has been reported yet, so the first one this shim sees is a transition.
+    _lastThermalState = -1;
+#endif
   }
   return self;
 }
@@ -535,8 +632,162 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
   _shutDown = false;
 }
 
+/// Publishes the device status callback; `NULL` stops the reporting.
+///
+/// This outlives a reconfigure: `teardown` drops the frame callback but not this one, so a
+/// pipeline rebuilt by `setWidth:…` keeps reporting status.
+- (void)setStatusCallback:(scwc_mac_status_cb)callback user:(void *)user {
+  std::lock_guard<std::mutex> guard(_callbackLock);
+  _statusCallback = callback;
+  _statusUser = user;
+}
+
+/// Subscribes to the notifications that report thermal pressure and session interruptions.
+///
+/// Both are iOS concerns: a macOS session reports what happens to it through runtime errors
+/// instead, and its thermal state is not part of this backend's contract, so macOS
+/// subscribes to nothing and keeps the behaviour it has always had.
+- (void)subscribeNotifications {
+#if TARGET_OS_IPHONE
+  __weak ScwcMacCapture *weakSelf = self;
+  // The observers are registered against the session, and the restart below only applies to
+  // that same session: a reconfigure builds a new one.
+  AVCaptureSession *session = _session;
+
+  if (@available(iOS 11.0, *)) {
+    _thermalObserver = [[NSNotificationCenter defaultCenter]
+        addObserverForName:NSProcessInfoThermalStateDidChangeNotification
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification *notification) {
+                  (void)notification;
+                  ScwcMacCapture *capture = weakSelf;
+                  if (capture != nil) {
+                    // Only logging and a status callback: safe on the posting thread.
+                    [capture reportThermalState:(int32_t)[NSProcessInfo processInfo].thermalState];
+                  }
+                }];
+    // The state at subscription is the first transition this shim has to report.
+    [self reportThermalState:(int32_t)[NSProcessInfo processInfo].thermalState];
+  }
+
+  // The interruption handlers only log, restart and take the shim's locks, but they arrive on
+  // the thread that posted the notification, so the restart is handed to the delegate queue:
+  // AVFoundation calls then stay off that foreign thread, and the restart cannot interleave
+  // with `teardown`, which stops and drops the session under `_sessionLock` before it drains
+  // that queue.
+  _interruptionObserver = [[NSNotificationCenter defaultCenter]
+      addObserverForName:AVCaptureSessionWasInterruptedNotification
+                  object:session
+                   queue:nil
+              usingBlock:^(NSNotification *notification) {
+                NSNumber *reason = notification.userInfo[AVCaptureSessionInterruptionReasonKey];
+                NSLog(@"[scwc-capture] the capture session was interrupted (%@); capture stays "
+                       "paused until the interruption ends",
+                      reason);
+              }];
+
+  _interruptionEndedObserver = [[NSNotificationCenter defaultCenter]
+      addObserverForName:AVCaptureSessionInterruptionEndedNotification
+                  object:session
+                   queue:nil
+              usingBlock:^(NSNotification *notification) {
+                (void)notification;
+                ScwcMacCapture *capture = weakSelf;
+                if (capture == nil) {
+                  return;
+                }
+                dispatch_async(capture->_delegateQueue, ^{
+                  ScwcMacCapture *capture = weakSelf;
+                  if (capture != nil) {
+                    [capture resumeAfterInterruption:session];
+                  }
+                });
+              }];
+#endif
+}
+
+/// Cancels the subscriptions; afterwards no notification block reaches this object again.
+///
+/// A block that is already running is left to finish, which is why the interrupt handlers
+/// check the lock-protected state before they act.
+- (void)unsubscribeNotifications {
+#if TARGET_OS_IPHONE
+  NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+  if (_thermalObserver != nil) {
+    [center removeObserver:_thermalObserver];
+    _thermalObserver = nil;
+  }
+  if (_interruptionObserver != nil) {
+    [center removeObserver:_interruptionObserver];
+    _interruptionObserver = nil;
+  }
+  if (_interruptionEndedObserver != nil) {
+    [center removeObserver:_interruptionEndedObserver];
+    _interruptionEndedObserver = nil;
+  }
+#endif
+}
+
+#if TARGET_OS_IPHONE
+/// Logs one thermal transition and forwards it to Rust.
+///
+/// The protocol's answer to heat is an encoder bitrate reduction — the resolution and the
+/// frame rate are the operator's to change — and that policy lives in the core; the shim
+/// only reports what the system says.
+- (void)reportThermalState:(int32_t)state {
+  scwc_mac_status_cb callback = NULL;
+  void *user = NULL;
+  {
+    std::lock_guard<std::mutex> guard(_callbackLock);
+    if (_shutDown || state == _lastThermalState) {
+      return;
+    }
+    _lastThermalState = state;
+    callback = _statusCallback;
+    user = _statusUser;
+  }
+
+  NSLog(@"[scwc-capture] the device thermal state is now %d (0 nominal, 3 critical)", (int)state);
+  if (callback != NULL) {
+    callback(user, state);
+  }
+}
+
+/// Restarts a session that an interruption stopped.
+///
+/// AVFoundation restarts a session after an interruption when it deems that appropriate; a
+/// phone call keeps it stopped until it ends, which is what this is for. Only the session the
+/// interruption belonged to is restarted — a reconfigure may have replaced it in the
+/// meantime — and one that is already running, or whose pipeline is gone, is left alone.
+- (void)resumeAfterInterruption:(AVCaptureSession *)session {
+  {
+    std::lock_guard<std::mutex> guard(_callbackLock);
+    if (_shutDown) {
+      return;
+    }
+  }
+
+  // Held while the session starts: it is the lock `teardown` takes to stop and drop the
+  // session, so the two cannot interleave.
+  std::lock_guard<std::mutex> guard(_sessionLock);
+  if (_session != session || [session isRunning]) {
+    return;
+  }
+  NSLog(@"[scwc-capture] the interruption ended, resuming capture");
+  @try {
+    [session startRunning];
+  } @catch (NSException *exception) {
+    NSLog(@"[scwc-capture] the capture session did not resume: %@", exception.reason);
+  }
+}
+#endif
+
 /// Stops the session and the encoder; afterwards no callback can reach Rust.
 - (void)teardown {
+  // First, so that no further notification is posted into this object.
+  [self unsubscribeNotifications];
+
   {
     std::lock_guard<std::mutex> guard(_callbackLock);
     _shutDown = true;
@@ -547,21 +798,27 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
   if (_output != nil) {
     [_output setSampleBufferDelegate:nil queue:nil];
   }
-  if (_session != nil) {
-    if ([_session isRunning]) {
-      [_session stopRunning];
+  {
+    // Shared with the iOS interruption handler, which restarts the session from the
+    // delegate queue.
+    std::lock_guard<std::mutex> guard(_sessionLock);
+    if (_session != nil) {
+      if ([_session isRunning]) {
+        [_session stopRunning];
+      }
+      for (AVCaptureInput *input in [_session inputs]) {
+        [_session removeInput:input];
+      }
+      for (AVCaptureOutput *output in [_session outputs]) {
+        [_session removeOutput:output];
+      }
+      _session = nil;
+      _output = nil;
+      _format = nil;
     }
-    for (AVCaptureInput *input in [_session inputs]) {
-      [_session removeInput:input];
-    }
-    for (AVCaptureOutput *output in [_session outputs]) {
-      [_session removeOutput:output];
-    }
-    _session = nil;
-    _output = nil;
-    _format = nil;
   }
-  // Drain the delegate queue: a `captureOutput:` already enqueued would run otherwise.
+  // Drain the delegate queue: a `captureOutput:` — or an interruption handler — already
+  // enqueued would run otherwise.
   if (_delegateQueue != NULL) {
     dispatch_sync(_delegateQueue, ^{
     });
@@ -644,6 +901,19 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
 
   _session = [[AVCaptureSession alloc] init];
 
+#if TARGET_OS_IPHONE
+  // Without this preset, adding the input lets the session configure the device to suit its
+  // own default preset, which would throw away the format and frame rate chosen above. The
+  // input-priority preset says the input dictates the format instead; it does not exist on
+  // macOS, where the session adopts the active format on its own, so macOS is left alone.
+  if ([_session canSetSessionPreset:AVCaptureSessionPresetInputPriority]) {
+    [_session setSessionPreset:AVCaptureSessionPresetInputPriority];
+  } else {
+    NSLog(@"[scwc-capture] the capture session refused the input-priority preset; it may "
+           "override the selected format");
+  }
+#endif
+
   AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:_device error:&error];
   if (input == nil) {
     return fail(SCWC_MAC_ERR_UNSUPPORTED, [NSString stringWithFormat:@"cannot capture from %@: %@",
@@ -672,6 +942,9 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
   if (code != SCWC_MAC_OK) {
     return code;
   }
+
+  // Before the session runs, so an interruption during startup is not missed.
+  [self subscribeNotifications];
 
   @try {
     [_session startRunning];
@@ -721,6 +994,14 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
 }
 
 /// Keeps the newest frame for `take_photo` and hands it to the encoder.
+///
+/// The frame is passed on as the connection delivers it: this shim never sets a rotation on
+/// the connection, so nothing here turns the sensor's picture. Both the encoder and
+/// `take_photo` therefore see the sensor-native orientation, and rotating it to the
+/// interface orientation is the app layer's job — the protocol has no rotation field to
+/// describe it in. (On iOS 17+ that app layer is `AVCaptureDeviceRotationCoordinator`, which
+/// is also what knows the connection's default rotation, not always zero on the front camera
+/// of newer iPads.)
 - (void)captureOutput:(AVCaptureOutput *)output
     didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
            fromConnection:(AVCaptureConnection *)connection {
@@ -803,7 +1084,8 @@ extern "C" int32_t scwc_mac_enumerate(scwc_mac_camera_begin_cb begin_cb,
     }
 
     for (AVCaptureDevice *device in devices) {
-      begin_cb(user, device.uniqueID.UTF8String, device.localizedName.UTF8String);
+      NSString *name = device_name(device);
+      begin_cb(user, device.uniqueID.UTF8String, name.UTF8String);
 
       // One row per resolution the device announces, with its announced frame rates.
       std::vector<ResolutionRow> rows;
@@ -892,6 +1174,15 @@ extern "C" int32_t scwc_mac_open(const scwc_mac_config *cfg, scwc_mac_frame_cb f
   }
 }
 
+extern "C" int32_t scwc_mac_set_status_cb(void *handle, scwc_mac_status_cb cb, void *user) {
+  if (handle == NULL) {
+    return fail(SCWC_MAC_ERR_OS, @"status callback set without a handle");
+  }
+  ScwcMacCapture *capture = (__bridge ScwcMacCapture *)handle;
+  [capture setStatusCallback:cb user:user];
+  return SCWC_MAC_OK;
+}
+
 extern "C" int32_t scwc_mac_set_params(void *handle, uint32_t width, uint32_t height, uint32_t fps,
                                        int32_t codec, uint32_t bitrate_kbps) {
   if (handle == NULL) {
@@ -917,6 +1208,9 @@ extern "C" void scwc_mac_close(void *handle) {
   }
   @autoreleasepool {
     ScwcMacCapture *capture = (__bridge_transfer ScwcMacCapture *)handle;
+    // The status callback outlives a reconfigure, so it is dropped here explicitly: after
+    // this returns, no callback of any kind can reach Rust.
+    [capture setStatusCallback:NULL user:NULL];
     [capture shutdown];
   }
 }

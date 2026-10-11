@@ -19,7 +19,9 @@ pub enum CaptureError {
     ///
     /// On macOS a CLI process inherits the permission of the terminal that launched it, so
     /// this means the invoking application is missing the camera entitlement in
-    /// System Settings > Privacy & Security > Camera; on Windows it means the camera privacy
+    /// System Settings > Privacy & Security > Camera; on iOS it means the user denied the
+    /// camera to the host app (whose `Info.plist` has to declare `NSCameraUsageDescription`
+    /// for the request to be made at all); on Windows it means the camera privacy
     /// setting denies the desktop application access.
     #[error("camera access denied")]
     PermissionDenied,

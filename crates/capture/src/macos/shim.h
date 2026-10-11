@@ -2,9 +2,11 @@
  * C ABI between the Rust side of `scwc-capture` and the AVFoundation / VideoToolbox shim.
  *
  * Every function is called from the thread that owns the `CaptureSource`; the shim owns its
- * own capture and encoder threads and serializes them against these calls with locks. On
- * failure, a function returns a non-zero code and leaves a human-readable message in the
- * calling thread's slot, which `scwc_mac_last_error` copies out.
+ * own capture and encoder threads and serializes them against these calls with locks. The
+ * callbacks are invoked on those threads, except the status callback, which runs on whichever
+ * thread the platform posted its notification from. On failure, a function returns a non-zero
+ * code and leaves a human-readable message in the calling thread's slot, which
+ * `scwc_mac_last_error` copies out.
  */
 #ifndef SCWC_MAC_SHIM_H
 #define SCWC_MAC_SHIM_H
@@ -44,6 +46,12 @@ typedef void (*scwc_mac_frame_cb)(void *user, const uint8_t *data, size_t len,
 /* One JPEG still; fired at most once per `scwc_mac_take_photo` call. */
 typedef void (*scwc_mac_jpeg_cb)(void *user, const uint8_t *data, size_t len);
 
+/* Device status change; `state` is a thermal state, 0 nominal to 3 critical.
+ *
+ * iOS only: the shim subscribes to `NSProcessInfoThermalStateDidChangeNotification` there,
+ * and never calls this on macOS, where this backend reports no status. */
+typedef void (*scwc_mac_status_cb)(void *user, int32_t state);
+
 /* Start of one camera in the enumeration stream. */
 typedef void (*scwc_mac_camera_begin_cb)(void *user, const char *id, const char *name);
 
@@ -57,6 +65,10 @@ int32_t scwc_mac_enumerate(scwc_mac_camera_begin_cb begin_cb,
 /* Starts capture; writes the pipeline handle to `out_handle` on success. */
 int32_t scwc_mac_open(const scwc_mac_config *cfg, scwc_mac_frame_cb frame_cb, void *user,
                       void **out_handle);
+
+/* Registers the device status callback, or unregisters it when `cb` is NULL. The callback
+ * stays registered until it is replaced, so a `scwc_mac_set_params` reconfigure keeps it. */
+int32_t scwc_mac_set_status_cb(void *handle, scwc_mac_status_cb cb, void *user);
 
 /* Rebuilds the session and the encoder for new parameters. */
 int32_t scwc_mac_set_params(void *handle, uint32_t width, uint32_t height, uint32_t fps,

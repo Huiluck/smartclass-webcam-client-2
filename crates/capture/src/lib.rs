@@ -8,10 +8,11 @@
 //!
 //! # Backends
 //!
-//! - **macOS**: AVFoundation for capture, VideoToolbox for encoding, both driven by an
-//!   Objective-C++ shim compiled by this crate's build script. Frames leave the encoder as
-//!   Annex B access units with parameter sets in front of every IDR, which is what the
-//!   server's H.264/H.265 consumers expect.
+//! - **macOS and iOS**: AVFoundation for capture, VideoToolbox for encoding, both driven by
+//!   one Objective-C++ shim compiled by this crate's build script (`src/macos/`, shared by
+//!   both platforms — the differences are behind `TARGET_OS_IPHONE` in the shim). Frames
+//!   leave the encoder as Annex B access units with parameter sets in front of every IDR,
+//!   which is what the server's H.264/H.265 consumers expect.
 //! - **Linux**: V4L2 (`/dev/video*`) for capture and VAAPI for encoding, both spoken to
 //!   directly from Rust with no C shim, so the crate cross-checks without system headers.
 //!   MJPEG-only cameras are decoded in software before encoding; see the `linux` module for
@@ -22,9 +23,34 @@
 //!   compiled. Hardware encoders (NVENC, Quick Sync, AMF) are preferred and the inbox
 //!   software H.264 encoder is the loud fallback. See the `windows` module for the
 //!   behaviours that hardware testing still has to confirm.
-//! - **Everything else**: [`enumerate_cameras`] and [`open`] fail with
+//! - **Everything else** (Android among them): [`enumerate_cameras`] and [`open`] fail with
 //!   [`CaptureError::Os`]; the crate still compiles so that the rest of the workspace can
 //!   be built and tested on any host.
+//!
+//! # iOS
+//!
+//! The iOS side of the shim is the macOS one with the platform's own device discovery,
+//! session preset, interruption and thermal handling:
+//!
+//! - **Permission**: the host app *must* declare `NSCameraUsageDescription` in its
+//!   `Info.plist`. The shim asks for access when the process has not been asked before, and
+//!   iOS terminates a process that requests camera access — or starts a capture session —
+//!   without that key. A denial or a restriction comes back as
+//!   [`CaptureError::PermissionDenied`], the same as on macOS.
+//! - **Cameras**: enumeration reports the built-in wide-angle, ultra-wide and telephoto
+//!   cameras (the ones the device actually has), and each name carries the position
+//!   (front/back), because iOS calls every one of them "Camera".
+//! - **Orientation**: frames are handed on as the sensor produces them. Nothing in this
+//!   crate rotates them to the interface orientation — that is the app layer's job, since
+//!   the protocol carries no rotation field to describe it in.
+//! - **Thermal pressure**: state transitions are logged, and the protocol's answer to heat
+//!   is an encoder bitrate reduction (never a change of resolution or frame rate), which the
+//!   core owns.
+//! - **Interruptions**: a session that a phone call or another client takes away is logged
+//!   and restarted once the interruption ends.
+//!
+//! None of the above has run on real iOS hardware yet: the simulator exposes no camera, so
+//! the behaviours are the ones the platform documents, not ones this crate has observed.
 //!
 //! # Frame pacing
 //!
@@ -60,9 +86,9 @@
 mod error;
 mod source;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod macos;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use macos as sys;
 
 #[cfg(target_os = "linux")]
@@ -77,12 +103,14 @@ use windows as sys;
 
 #[cfg(not(any(
     target_os = "macos",
+    target_os = "ios",
     target_os = "linux",
     target_os = "windows"
 )))]
 mod unsupported;
 #[cfg(not(any(
     target_os = "macos",
+    target_os = "ios",
     target_os = "linux",
     target_os = "windows"
 )))]
@@ -115,8 +143,8 @@ pub fn enumerate_cameras() -> Result<Vec<CameraInfo>, CaptureError> {
 /// presets are a plain matrix rather than pre-flattened registration lists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CameraInfo {
-    /// Stable device identifier (AVFoundation `uniqueID` on macOS, the device interface
-    /// path on Windows).
+    /// Stable device identifier (AVFoundation `uniqueID` on macOS and iOS, the device
+    /// interface path on Windows).
     pub id: String,
     /// Human-readable device name.
     pub name: String,
