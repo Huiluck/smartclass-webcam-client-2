@@ -38,7 +38,7 @@ class _MyAppState extends State<MyApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'SmartClass device agent',
+      title: 'SC Webcam',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
       home: HomePage(state: _state),
@@ -495,7 +495,7 @@ class HomePage extends StatelessWidget {
     return ListenableBuilder(
       listenable: state,
       builder: (context, _) => Scaffold(
-        appBar: AppBar(title: const Text('SmartClass device agent')),
+        appBar: AppBar(title: const Text('SC Webcam')),
         body: Padding(
           padding: const EdgeInsets.all(12),
           child: Column(
