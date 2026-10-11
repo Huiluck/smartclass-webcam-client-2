@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# The Flutter shell's bridge crate is built by cargokit with its own lockfile and
+# cdylib/staticlib crate types, so it stays out of this workspace.
+exclude = ["app/rust_lib"]
 
 [workspace.package]
 version = "0.1.0"
