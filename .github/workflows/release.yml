@@ -154,16 +154,13 @@ jobs:
           rm -rf "$appdir"
           mkdir -p "$appdir"
           cp -a "$bundle/." "$appdir/"
-          # The bundle root holds exactly one executable (BINARY_NAME in
-          # linux/CMakeLists.txt, currently `sc_webcam`); use its name for both
-          # AppRun and the desktop entry so a product rename cannot break either.
-          exe="$(find "$bundle" -maxdepth 1 -type f -perm -u+x -print -quit)"
-          test -n "$exe"
-          exe="${exe##*/}"
-          ln -sf "$exe" "$appdir/AppRun"
+          # The bundle's entry point is the `sc_webcam` executable (BINARY_NAME
+          # in linux/CMakeLists.txt).
+          ln -sf sc_webcam "$appdir/AppRun"
 
-          # Minimal 256x256 placeholder icon, written straight as a PNG (zlib is
-          # in the stdlib, so no image tooling is needed).
+          # Minimal 256x256 placeholder icon (AppDir/<Icon>.png is where
+          # appimagetool looks), written straight as a PNG: zlib is in the
+          # stdlib, so no image tooling is needed.
           python3 - <<'PY'
           import struct, zlib
           size = 256
@@ -174,16 +171,16 @@ jobs:
           png += chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
           png += chunk(b"IDAT", zlib.compress(raw, 9))
           png += chunk(b"IEND", b"")
-          with open("AppDir/scwc.png", "wb") as f:
+          with open("AppDir/sc_webcam.png", "wb") as f:
               f.write(png)
           PY
 
-          cat > "$appdir/scwc.desktop" <<EOF
+          cat > "$appdir/scwc.desktop" <<'EOF'
           [Desktop Entry]
           Type=Application
-          Name=SmartClass Webcam Client
-          Exec=${exe}
-          Icon=scwc
+          Name=SC Webcam
+          Exec=sc_webcam
+          Icon=sc_webcam
           Categories=Utility;
           Terminal=false
           EOF
@@ -237,11 +234,11 @@ jobs:
         run: |
           set -euo pipefail
           # The bundle name comes from macos/Runner/Configs/AppInfo.xcconfig
-          # (PRODUCT_NAME), so resolve it here rather than pinning it.
-          app_bundle="$(find build/macos/Build/Products/Release -maxdepth 1 -name '*.app' -print -quit)"
-          test -n "$app_bundle"
+          # (PRODUCT_NAME = SC Webcam).
           # --keepParent keeps the .app directory as the zip's top-level entry.
-          ditto -c -k --sequesterRsrc --keepParent "$app_bundle" "scwc-client-${TAG}-macos.zip"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "build/macos/Build/Products/Release/SC Webcam.app" \
+            "scwc-client-${TAG}-macos.zip"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
