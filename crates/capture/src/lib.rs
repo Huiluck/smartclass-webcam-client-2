@@ -12,6 +12,16 @@
 //!   Objective-C++ shim compiled by this crate's build script. Frames leave the encoder as
 //!   Annex B access units with parameter sets in front of every IDR, which is what the
 //!   server's H.264/H.265 consumers expect.
+//! - **Linux**: V4L2 (`/dev/video*`) for capture and VAAPI for encoding, both spoken to
+//!   directly from Rust with no C shim, so the crate cross-checks without system headers.
+//!   MJPEG-only cameras are decoded in software before encoding; see the `linux` module for
+//!   the runtime requirements (libva, a render node, the v4l2 device group) and for the
+//!   behaviours that hardware testing still has to confirm.
+//! - **Windows**: Media Foundation for capture and encoding, WIC for stills, driven from
+//!   pure Rust — Media Foundation is COM and the `windows` crate covers it, so no shim is
+//!   compiled. Hardware encoders (NVENC, Quick Sync, AMF) are preferred and the inbox
+//!   software H.264 encoder is the loud fallback. See the `windows` module for the
+//!   behaviours that hardware testing still has to confirm.
 //! - **Everything else**: [`enumerate_cameras`] and [`open`] fail with
 //!   [`CaptureError::Os`]; the crate still compiles so that the rest of the workspace can
 //!   be built and tested on any host.
@@ -55,9 +65,27 @@ mod macos;
 #[cfg(target_os = "macos")]
 use macos as sys;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux as sys;
+
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+use windows as sys;
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "windows"
+)))]
 mod unsupported;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "windows"
+)))]
 use unsupported as sys;
 
 pub use crate::error::CaptureError;
@@ -87,7 +115,8 @@ pub fn enumerate_cameras() -> Result<Vec<CameraInfo>, CaptureError> {
 /// presets are a plain matrix rather than pre-flattened registration lists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CameraInfo {
-    /// Stable device identifier (AVFoundation `uniqueID` on macOS).
+    /// Stable device identifier (AVFoundation `uniqueID` on macOS, the device interface
+    /// path on Windows).
     pub id: String,
     /// Human-readable device name.
     pub name: String,

@@ -14,6 +14,28 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# Windows backend: Media Foundation for capture and encoding, WIC for stills. Pure Rust
+# bindings, so no C shim is needed on this platform (see build.rs).
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Imaging",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
+
+# Linux backend: V4L2 for capture and VAAPI for encoding, both spoken to through libc
+# syscalls and hand-declared FFI, so `cargo check` needs no system headers or C toolchain.
+# `libc` and `jpeg-decoder` are pure Rust; `jpeg-decoder` decodes the MJPEG frames a UVC
+# camera offers at the top resolutions (a hardware encoder cannot take MJPEG directly).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+jpeg-decoder = "0.3"
+jpeg-encoder = { workspace = true }
+
 [build-dependencies]
 cc = "1"
 

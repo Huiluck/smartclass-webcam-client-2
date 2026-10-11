@@ -95,7 +95,7 @@ impl Handle {
     pub(crate) fn open(
         cfg: &CaptureConfig,
         frame_cb: FrameCallback,
-        jpeg_cb: JpegCallback,
+        _jpeg_cb: JpegCallback,
         user: *mut c_void,
     ) -> Result<Self, CaptureError> {
         let codec = shim_codec(cfg.codec)?;
