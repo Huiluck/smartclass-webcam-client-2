@@ -1,4 +1,7 @@
-//! macOS backend: the Objective-C++ shim over AVFoundation and VideoToolbox.
+//! Apple backend: the Objective-C++ shim over AVFoundation and VideoToolbox.
+//!
+//! One module serves macOS and iOS, because the shim behind it is one file compiled for both
+//! (see `build.rs`); what differs between the platforms is settled inside the shim.
 //!
 //! The shim (`shim.mm`, built by `build.rs`) owns every platform object; this module only
 //! translates between Rust values and the C ABI declared in `shim.h`. Failure detail is
@@ -9,7 +12,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
 
 use scwc_protocol::Codec;
-use tracing::error;
+use tracing::{error, info, warn};
 
 use crate::error::CaptureError;
 use crate::source::{FrameCallback, JpegCallback};
@@ -39,6 +42,12 @@ type CameraBeginCallback = unsafe extern "C" fn(user: *mut c_void, id: *const c_
 type CameraFormatCallback =
     unsafe extern "C" fn(user: *mut c_void, resolution: *const c_char, fps: u32);
 
+/// Backend entry point invoked when the platform reports a change of device status.
+///
+/// The status is a thermal state: 0 nominal, 1 fair, 2 serious, 3 critical. Only iOS reports
+/// it; the shim never calls this on macOS.
+type StatusCallback = unsafe extern "C" fn(user: *mut c_void, state: i32);
+
 /// One capture request, as the shim expects it.
 ///
 /// The fields are only written on this side; the shim reads them across the ABI.
@@ -66,6 +75,12 @@ unsafe extern "C" {
         frame_cb: FrameCallback,
         user: *mut c_void,
         out_handle: *mut *mut c_void,
+    ) -> i32;
+    /// `cb` is null to unregister; a null pointer is a valid `Option` here.
+    fn scwc_mac_set_status_cb(
+        handle: *mut c_void,
+        cb: Option<StatusCallback>,
+        user: *mut c_void,
     ) -> i32;
     fn scwc_mac_set_params(
         handle: *mut c_void,
@@ -125,7 +140,31 @@ impl Handle {
                 "capture backend returned no handle".to_owned(),
             ));
         }
-        Ok(Self { raw })
+
+        let mut handle = Self { raw };
+        // The reported status is logged, not acted on: the protocol's response to thermal
+        // pressure is the core's bitrate policy. Registration cannot fail for a live handle,
+        // so a failure here closes the pipeline rather than leaving it half-reported.
+        if let Err(error) = handle.set_status_callback(Some(on_thermal_status), ptr::null_mut()) {
+            handle.close();
+            return Err(error);
+        }
+        Ok(handle)
+    }
+
+    /// Registers the shim's device-status callback; `None` unregisters it.
+    fn set_status_callback(
+        &self,
+        cb: Option<StatusCallback>,
+        user: *mut c_void,
+    ) -> Result<(), CaptureError> {
+        // SAFETY: `raw` is a live handle for as long as `self` exists, and `cb` is either null
+        // or a `'static` function that never unwinds, so no panic can cross into the shim.
+        let status = unsafe { scwc_mac_set_status_cb(self.raw, cb, user) };
+        if status != OK {
+            return Err(last_error());
+        }
+        Ok(())
     }
 
     /// Reconfigures the pipeline to new capture and encoder parameters.
@@ -232,6 +271,39 @@ fn shim_codec(codec: Codec) -> Result<i32, CaptureError> {
     }
 }
 
+/// The callback the shim invokes when the device's thermal state changes.
+///
+/// It runs on whichever thread the platform posted the notification from, so it does nothing
+/// but log: it must not unwind, and it must not touch the capture pipeline. The protocol's
+/// answer to heat is a lower encoder bitrate — `resolution` and `fps` are the operator's to
+/// change — and that policy is the core's, so the only thing this side does with the state is
+/// record it.
+unsafe extern "C" fn on_thermal_status(_user: *mut c_void, state: i32) {
+    let name = match state {
+        0 => "nominal",
+        1 => "fair",
+        2 => "serious",
+        3 => "critical",
+        unexpected => {
+            warn!(
+                state = unexpected,
+                "the platform reported a thermal state outside 0-3"
+            );
+            return;
+        }
+    };
+
+    if state < 2 {
+        info!(state = name, "the device thermal state changed");
+    } else {
+        warn!(
+            state = name,
+            "the device reports thermal pressure; the answer is a lower encoder bitrate, not a \
+             change of resolution or frame rate"
+        );
+    }
+}
+
 /// Reads the shim's thread-local failure message and maps it onto a [`CaptureError`].
 fn last_error() -> CaptureError {
     let mut buf = [0 as c_char; ERROR_BUFFER];
@@ -242,7 +314,7 @@ fn last_error() -> CaptureError {
         .to_string_lossy()
         .into_owned();
     if !message.is_empty() {
-        error!(code = status, detail = %message, "macOS capture backend failure");
+        error!(code = status, detail = %message, "Apple capture backend failure");
     }
 
     match status {
