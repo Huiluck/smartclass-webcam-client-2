@@ -1,7 +1,9 @@
 //! Compiles the macOS capture/encode shim and links the frameworks it uses.
 //!
-//! The shim exists only on macOS; every other target gets the stub backend in
-//! `src/unsupported.rs` and this script does nothing.
+//! Only macOS needs a build script: the Windows backend talks to Media Foundation through
+//! the `windows` crate and the Linux backend speaks to V4L2/VAAPI itself, so both are plain
+//! Rust with no shim to compile. Targets without a backend get `src/unsupported.rs` and this
+//! script does nothing.
 
 use std::env;
 
@@ -19,13 +21,14 @@ const FRAMEWORKS: [&str; 8] = [
 ];
 
 fn main() {
-    println!("cargo::rerun-if-changed=src/macos/shim.mm");
-    println!("cargo::rerun-if-changed=src/macos/shim.h");
     println!("cargo::rerun-if-changed=build.rs");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
+
+    println!("cargo::rerun-if-changed=src/macos/shim.mm");
+    println!("cargo::rerun-if-changed=src/macos/shim.h");
 
     cc::Build::new()
         .file("src/macos/shim.mm")
