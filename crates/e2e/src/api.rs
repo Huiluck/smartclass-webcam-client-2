@@ -134,24 +134,13 @@ impl ManagementApi {
     /// Poll `GET /healthz` until the process answers `{"status":"ok"}`.
     pub async fn wait_healthz(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
-        let mut last = String::from("no attempt made");
         loop {
-            match self
-                .client
-                .get(self.url("/healthz"))
-                .send()
-                .await
-                .and_then(reqwest::Response::error_for_status)
-            {
-                Ok(response) => match response.json::<Health>().await {
-                    Ok(health) if health.status == "ok" => return Ok(()),
-                    Ok(health) => last = format!("status {}", health.status),
-                    Err(error) => last = error.to_string(),
-                },
-                Err(error) => last = error.to_string(),
-            }
-            if Instant::now() >= deadline {
-                bail!("the server was not healthy after {timeout:?}: {last}");
+            match self.probe_healthz().await {
+                Ok(()) => return Ok(()),
+                Err(error) if Instant::now() >= deadline => {
+                    bail!("the server was not healthy after {timeout:?}: {error}");
+                }
+                Err(_) => {}
             }
             sleep(Duration::from_millis(250)).await;
         }
@@ -161,20 +150,40 @@ impl ManagementApi {
     /// embedded migrations have run.
     pub async fn wait_database(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
-        let mut last = String::from("no attempt made");
         loop {
             match self.get_json::<DeviceList>("/api/devices").await {
                 Ok(list) => {
                     debug!(devices = list.items.len(), "database ready");
                     return Ok(());
                 }
-                Err(error) => last = error.to_string(),
-            }
-            if Instant::now() >= deadline {
-                bail!("the database was not ready after {timeout:?}: {last}");
+                Err(error) if Instant::now() >= deadline => {
+                    bail!("the database was not ready after {timeout:?}: {error}");
+                }
+                Err(_) => {}
             }
             sleep(Duration::from_millis(250)).await;
         }
+    }
+
+    /// One `GET /healthz` probe; the error carries a human-readable reason.
+    async fn probe_healthz(&self) -> std::result::Result<(), String> {
+        let response = self
+            .client
+            .get(self.url("/healthz"))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("HTTP {}", response.status()));
+        }
+        let health = response
+            .json::<Health>()
+            .await
+            .map_err(|error| error.to_string())?;
+        if health.status != "ok" {
+            return Err(format!("status {}", health.status));
+        }
+        Ok(())
     }
 
     /// Register a device and return its id and one-time token.
@@ -270,13 +279,12 @@ impl ManagementApi {
         timeout: Duration,
     ) -> Result<Stream> {
         let deadline = Instant::now() + timeout;
-        let mut observed = String::from("absent");
         loop {
-            match self.find_stream(device_id, stream_id).await? {
+            let observed = match self.find_stream(device_id, stream_id).await? {
                 Some(stream) if stream.status == status => return Ok(stream),
-                Some(stream) => observed = stream.status,
-                None => observed = "absent".to_string(),
-            }
+                Some(stream) => stream.status,
+                None => "absent".to_string(),
+            };
             if Instant::now() >= deadline {
                 bail!("stream {stream_id} did not reach status {status:?} within {timeout:?} (last seen: {observed})");
             }

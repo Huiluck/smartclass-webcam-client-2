@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use tracing::info;
 
 use crate::api::{DeviceCredentials, ManagementApi};
-use crate::artifacts::{CachePaths, ensure_artifacts};
+use crate::artifacts::{CachePaths, PgBin, ensure_artifacts};
 use crate::client::{ClientOptions, ClientProcess, spawn_cli};
 use crate::postgres::Postgres;
 use crate::server::ServerProcess;
@@ -36,21 +36,18 @@ pub struct TestEnv {
 }
 
 impl TestEnv {
-    /// Ensure every cached artifact exists, downloading and building only on a cold cache.
+    /// Ensure the cached server build exists, cloning and compiling only on a cold cache.
     pub async fn ensure() -> Result<CachePaths> {
         ensure_artifacts().await
     }
 
-    /// Ensure the artifacts, then boot PostgreSQL and the server and wait until both answer.
+    /// Ensure the cached server build, then boot a scratch PostgreSQL cluster from the host's
+    /// binaries and the server, waiting until both answer.
     pub async fn start() -> Result<Self> {
+        let pg_bin = PgBin::resolve()?;
         let paths = Self::ensure().await?;
         let unique = unique_id();
-        let postgres = Postgres::start(
-            paths.pg_bin_dir(),
-            &paths.run_dir(),
-            &unique,
-            PREFERRED_PG_PORT,
-        )?;
+        let postgres = Postgres::start(pg_bin, &paths.run_dir(), &unique, PREFERRED_PG_PORT)?;
         let db_url = postgres.dsn();
         let server = ServerProcess::spawn(
             &paths.server_bin(),
