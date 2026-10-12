@@ -27,14 +27,16 @@
 //! protocol lets a device move neither `resolution` nor `fps` without an operator command (see
 //! [`thermal`]).
 //!
-//! Everything the core can ask of a camera is wired, and most of it has run on hardware — a
-//! vivo V2405A (MediaTek, Android 16) through the Flutter shell, which is the context a device
-//! client actually runs in:
+//! Most of that wiring has since run on hardware — a vivo V2405A (MediaTek, Android 16)
+//! through the Flutter shell, which is the context a device client actually runs in:
 //!
 //! - **Streaming**: registered and attached, then sent 1280x720@60 H.264 from the hardware
-//!   encoder for minutes with `dropped 0` in the core's counters, and later 3840x2160@60 —
-//!   which the server's own bookkeeping confirms at 90 frames per 1500 ms segment (60.0 fps)
-//!   and ~11.3 MB per segment (~60 Mbps).
+//!   encoder with `dropped 0` in the core's counters, and later 3840x2160@60 at that same
+//!   cadence: every steady-state segment row advances 150 frames per ~2500 ms flush, and 2 220
+//!   frames land in ~37.6 s of segment time (≈59 fps). Those rows carry ~62 MB in total, ≈13 Mbps
+//!   — the 11.3 MB opening row is the first IDR, not the rate. The stream's wall-clock window was
+//!   ~78 s, so the dev server persisted about half of it; closing that gap is what a soak run is
+//!   for.
 //! - **`switch_camera`**: the server moved the camera to 640x480@30 and then to 3840x2160@60;
 //!   the session and encoder were rebuilt on the same open device each time and frames kept
 //!   flowing afterwards.
