@@ -133,6 +133,26 @@ jobs:
           path: app/scwc-client-${{ needs.resolve.outputs.tag }}-windows-${{ matrix.arch }}.zip
           if-no-files-found: error
 
+      - name: Install Inno Setup
+        # Pinned via the Chocolatey package version (SHA pinning is not
+        # available for choco).
+        run: choco install innosetup --version=6.7.1 --no-progress -y
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          $ver = $env:TAG -replace '^v', ''
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion="$ver" /DArch="${{ matrix.arch }}" app\installer\windows\sc_webcam.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scwc-client-${{ needs.resolve.outputs.tag }}-windows-${{ matrix.arch }}-setup.exe
+          path: app/scwc-client-${{ needs.resolve.outputs.tag }}-windows-${{ matrix.arch }}-setup.exe
+          if-no-files-found: error
+
   linux:
     needs: resolve
     strategy:
