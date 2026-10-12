@@ -84,15 +84,181 @@ pub trait FrameSource: Send {
     fn preferred_codec(&self) -> Codec;
 }
 
-/// Encoder bitrate assumed when a command carries no preference.
+/// Scaffolding the core's own tests drive a session with.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::future::Future;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    use scwc_protocol::Codec;
+
+    use super::{EncodedFrame, FrameSource};
+    use crate::SourceError;
+
+    /// One `set_parameters` call, as it reached the source.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct Applied {
+        /// Resolution the call asked for.
+        pub(crate) resolution: String,
+        /// Frame rate the call asked for.
+        pub(crate) fps: u32,
+        /// Codec the call asked for.
+        pub(crate) codec: Codec,
+        /// Bitrate the call asked for.
+        pub(crate) bitrate_kbps: u32,
+    }
+
+    /// A [`FrameSource`] that records its reconfigurations and never produces a frame.
+    ///
+    /// Idling forever keeps a stream alive without letting test timing depend on frames;
+    /// the media task cancels the call when the stream stops.
+    pub(crate) struct RecordingSource {
+        codec: Codec,
+        applied: Arc<Mutex<Vec<Applied>>>,
+    }
+
+    impl RecordingSource {
+        /// Builds a source whose reconfigurations are collected in the returned handle.
+        pub(crate) fn new(codec: Codec) -> (Self, Arc<Mutex<Vec<Applied>>>) {
+            let applied = Arc::new(Mutex::new(Vec::new()));
+            let source = Self {
+                codec,
+                applied: applied.clone(),
+            };
+            (source, applied)
+        }
+    }
+
+    impl FrameSource for RecordingSource {
+        fn next_frame(&mut self) -> impl Future<Output = EncodedFrame> + Send {
+            std::future::pending::<EncodedFrame>()
+        }
+
+        fn set_parameters(
+            &mut self,
+            resolution: &str,
+            fps: u32,
+            codec: Codec,
+            bitrate_kbps: u32,
+        ) -> Result<(), SourceError> {
+            self.applied
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(Applied {
+                    resolution: resolution.to_owned(),
+                    fps,
+                    codec,
+                    bitrate_kbps,
+                });
+            Ok(())
+        }
+
+        async fn take_photo(&mut self) -> Result<Vec<u8>, SourceError> {
+            Ok(Vec::new())
+        }
+
+        fn preferred_codec(&self) -> Codec {
+            self.codec
+        }
+    }
+
+    /// A directory under the system temporary directory that removes itself again.
+    pub(crate) struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        /// Creates a directory named after `name`, unique per process and call.
+        pub(crate) fn new(name: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default();
+            let path = std::env::temp_dir().join(format!(
+                "scwc-{}-{}-{name}",
+                std::process::id(),
+                unique
+            ));
+            std::fs::create_dir_all(&path).expect("could not create a temporary directory");
+            Self { path }
+        }
+
+        /// The directory itself.
+        pub(crate) fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// Bits per pixel H.264 is expected to spend on a frame.
 ///
-/// Kept deliberately conservative: the protocol lets the server lower it through a later
-/// `switch_camera`, and overshooting costs uplink for no visible quality.
-pub(crate) fn default_bitrate_kbps(codec: Codec) -> u32 {
+/// Calibrated on the rate the client used to hardcode: 3840x2160 at 60 fps lands at about
+/// 53 Mbps, which was the flat H.264 default.
+const H264_BITS_PER_PIXEL: f64 = 0.107;
+
+/// Bits per pixel HEVC is expected to spend on a frame.
+///
+/// The same 4K60 stream lands at about 30 Mbps, which was the flat default for every other
+/// codec the protocol knows — including the heavier ones, whose rate the server lowers
+/// through a later `switch_camera` once it sees the load.
+const HEVC_BITS_PER_PIXEL: f64 = 0.060;
+
+/// Bitrate assumed when the resolution a caller holds cannot be read at all.
+///
+/// The source rejects such a request anyway, so the number only has to be sane.
+const UNREADABLE_RESOLUTION_BITRATE_KBPS: u32 = 30_000;
+
+/// Encoder bitrate the client assumes when no one names one.
+///
+/// The protocol has no field for a bitrate, so the client derives the rate it is about to
+/// spend from the stream itself: `width * height * fps` pixels per second at a
+/// codec-specific budget of bits per pixel. The result is deliberately conservative —
+/// overshooting costs uplink for no visible quality.
+///
+/// Public so a caller that opens the capture pipeline before handing it to the core — which
+/// needs a bitrate up front — derives exactly the number the core would.
+pub fn default_bitrate_kbps(codec: Codec, resolution: &str, fps: u32) -> u32 {
+    let Some((width, height)) = parse_resolution(resolution) else {
+        return UNREADABLE_RESOLUTION_BITRATE_KBPS;
+    };
+
+    let bits_per_pixel = match codec {
+        Codec::H264 => H264_BITS_PER_PIXEL,
+        _ => HEVC_BITS_PER_PIXEL,
+    };
+    let kbps = (width as f64 * height as f64 * fps as f64 * bits_per_pixel / 1000.0).ceil();
+
+    kbps.clamp(1.0, u32::MAX as f64) as u32
+}
+
+/// Splits a protocol resolution (`"3840x2160"`) into its sides.
+fn parse_resolution(resolution: &str) -> Option<(u32, u32)> {
+    let (width, height) = resolution.split_once(['x', 'X'])?;
+    let width = width.trim().parse().ok()?;
+    let height = height.trim().parse().ok()?;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+/// The protocol's own spelling of a codec, for events and messages a user reads.
+///
+/// Mirrors the closed vocabulary of [`scwc_protocol::Codec`], whose serialized names this
+/// repeats.
+pub(crate) fn codec_name(codec: Codec) -> &'static str {
     match codec {
-        Codec::H265 => 30_000,
-        Codec::H264 => 53_000,
-        _ => 30_000,
+        Codec::H264 => "h264",
+        Codec::H265 => "h265",
+        Codec::Mjpeg => "mjpeg",
+        Codec::Mpeg4 => "mpeg4",
+        Codec::Vp8 => "vp8",
+        Codec::Vp9 => "vp9",
+        Codec::Av1 => "av1",
     }
 }
 
@@ -288,5 +454,42 @@ async fn send_frames<F: FrameSource>(
             dropped = burst_len,
             "capture stopped while dropping frames"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UNREADABLE_RESOLUTION_BITRATE_KBPS, default_bitrate_kbps};
+    use scwc_protocol::Codec;
+
+    #[test]
+    fn the_default_bitrate_follows_the_stream_at_the_calibrated_rate() {
+        // The two anchors the per-pixel budgets were calibrated on: 4K60.
+        assert_eq!(
+            default_bitrate_kbps(Codec::H264, "3840x2160", 60),
+            53_251
+        );
+        assert_eq!(
+            default_bitrate_kbps(Codec::H265, "3840x2160", 60),
+            29_860
+        );
+        // A codec the budgets do not distinguish is rated like HEVC.
+        assert_eq!(default_bitrate_kbps(Codec::Mjpeg, "3840x2160", 60), 29_860);
+        // Half the pixels, half the rate.
+        assert_eq!(
+            default_bitrate_kbps(Codec::H264, "1920x1080", 30),
+            6_657
+        );
+    }
+
+    #[test]
+    fn an_unreadable_resolution_falls_back_to_a_sane_rate() {
+        for resolution in ["", "1920", "1920x", "x1080", "0x0", "wide"] {
+            assert_eq!(
+                default_bitrate_kbps(Codec::H264, resolution, 30),
+                UNREADABLE_RESOLUTION_BITRATE_KBPS,
+                "{resolution:?} must not be read as a resolution"
+            );
+        }
     }
 }
