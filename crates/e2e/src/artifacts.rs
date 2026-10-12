@@ -1,17 +1,15 @@
-//! Cached artifact setup: the PostgreSQL distribution and the server source/binary.
+//! Host prerequisites and the cached server build.
 //!
-//! Every network fetch lands in `.cache/downloads/<sha256-of-url>` first; extraction and the
-//! Go build are guarded by stamp files so a second test run does no work at all (and no
-//! network I/O).
+//! PostgreSQL is a *host* prerequisite: the harness locates the host's `initdb`/`pg_ctl`/
+//! `createdb`/`postgres` (see [`PgBin::resolve`]) and never downloads a database
+//! distribution. Only the server under test is fetched: its source is cloned and built into
+//! `.cache`, keyed by a stamp file so a second test run does nothing.
 
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use sha2::{Digest, Sha256};
 use tracing::info;
 
 /// Upstream repository of the server under test.
@@ -20,6 +18,7 @@ pub const SERVER_REPO_URL: &str = "https://github.com/crazy4chicken/smartclass-w
 /// Server tag the harness builds and runs.
 pub const SERVER_TAG: &str = "v0.3.1";
 
+<<<<<<< HEAD
 /// PostgreSQL version used as the server's database.
 pub const PG_VERSION: &str = "18.6.0";
 
@@ -86,6 +85,11 @@ fn initdb_binary() -> String {
     program_name("initdb")
 }
 
+=======
+/// Name of the marker file that keys the server build to its source tag.
+const STAMP_FILE: &str = ".scwc-e2e-stamp";
+
+>>>>>>> 44b0fe99a9f7450302d170d22d2b7c100a9e9fdd
 /// Absolute path of the workspace root (the directory holding `.cache`).
 ///
 /// The path is canonicalized and then stripped of the Windows verbatim prefix, because every
@@ -134,16 +138,6 @@ impl CachePaths {
         &self.root
     }
 
-    /// Directory holding every downloaded artifact, keyed by URL hash.
-    pub fn downloads_dir(&self) -> PathBuf {
-        self.root.join("downloads")
-    }
-
-    /// Directory holding extracted service distributions.
-    pub fn services_dir(&self) -> PathBuf {
-        self.root.join("services")
-    }
-
     /// Directory holding cloned source checkouts.
     pub fn src_dir(&self) -> PathBuf {
         self.root.join("src")
@@ -164,48 +158,125 @@ impl CachePaths {
         self.bin_dir().join(program_name("smartclass-webcam-server"))
     }
 
+<<<<<<< HEAD
     /// The `bin/` directory of the extracted PostgreSQL distribution.
     pub fn pg_bin_dir(&self) -> Result<PathBuf> {
         Ok(self.services_dir().join(pg_dir_name()?).join("bin"))
     }
 
+=======
+>>>>>>> 44b0fe99a9f7450302d170d22d2b7c100a9e9fdd
     /// Create every cache directory the harness uses.
     pub fn ensure_dirs(&self) -> Result<()> {
-        for dir in [
-            self.downloads_dir(),
-            self.services_dir(),
-            self.src_dir(),
-            self.bin_dir(),
-            self.run_dir(),
-        ] {
+        for dir in [self.src_dir(), self.bin_dir(), self.run_dir()] {
             fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         Ok(())
     }
 }
 
-/// Make every cached artifact available and return the resolved cache paths.
+/// The host PostgreSQL tools the harness drives.
 ///
+<<<<<<< HEAD
 /// Safe to call repeatedly: the second call is a few file-existence checks.
 pub async fn ensure_artifacts() -> Result<CachePaths> {
     // Refuses a host with no published PostgreSQL build before anything is downloaded.
     if pg_target().is_none() {
         return Err(unsupported_host());
+=======
+/// Resolved from `SCWC_PGBIN` (a directory holding the four binaries) when set, otherwise
+/// from `PATH`. PostgreSQL is not downloaded: install it on the host, for example with
+/// `brew install postgresql@18`.
+#[derive(Debug, Clone)]
+pub struct PgBin {
+    initdb: PathBuf,
+    pg_ctl: PathBuf,
+    createdb: PathBuf,
+    postgres: PathBuf,
+}
+
+impl PgBin {
+    /// Locate the host's PostgreSQL binaries and check that they run.
+    pub fn resolve() -> Result<Self> {
+        let dir = std::env::var_os("SCWC_PGBIN").map(PathBuf::from);
+
+        let find = |name: &str| -> Result<PathBuf> {
+            match &dir {
+                Some(dir) => {
+                    let candidate = dir.join(name);
+                    if candidate.is_file() {
+                        Ok(candidate)
+                    } else {
+                        bail!("SCWC_PGBIN={} does not contain {name}", dir.display())
+                    }
+                }
+                None => which(name).with_context(|| {
+                    format!(
+                        "locating {name}: set SCWC_PGBIN to the PostgreSQL bin directory \
+                         (for example /opt/homebrew/opt/postgresql@18/bin) or put it on PATH"
+                    )
+                }),
+            }
+        };
+
+        let pg = Self {
+            initdb: find("initdb")?,
+            pg_ctl: find("pg_ctl")?,
+            createdb: find("createdb")?,
+            postgres: find("postgres")?,
+        };
+
+        let output = Command::new(pg.postgres())
+            .arg("--version")
+            .output()
+            .with_context(|| format!("running {} --version", pg.postgres.display()))?;
+        if !output.status.success() {
+            bail!(
+                "{} --version failed: {}",
+                pg.postgres.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        info!(
+            version = %String::from_utf8_lossy(&output.stdout).trim(),
+            "using the host PostgreSQL"
+        );
+        Ok(pg)
+>>>>>>> 44b0fe99a9f7450302d170d22d2b7c100a9e9fdd
     }
 
+    /// `initdb`, which creates the scratch data directory.
+    pub fn initdb(&self) -> &Path {
+        &self.initdb
+    }
+
+    /// `pg_ctl`, which starts and stops the scratch cluster.
+    pub fn pg_ctl(&self) -> &Path {
+        &self.pg_ctl
+    }
+
+    /// `createdb`, which creates the `webcam` database.
+    pub fn createdb(&self) -> &Path {
+        &self.createdb
+    }
+
+    /// `postgres`, the server executable itself.
+    pub fn postgres(&self) -> &Path {
+        &self.postgres
+    }
+}
+
+/// Make the cached server build available and return the resolved cache paths.
+///
+/// Safe to call repeatedly: a warm cache is two file-existence checks.
+pub async fn ensure_artifacts() -> Result<CachePaths> {
     let paths = CachePaths::discover()?;
     paths.ensure_dirs()?;
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
-        .build()
-        .context("building the artifact download client")?;
-
-    ensure_postgres(&paths, &client).await?;
     ensure_server(&paths)?;
     Ok(paths)
 }
 
+<<<<<<< HEAD
 /// Fetch a URL into the cache, downloading only on a miss, and return the cached path.
 pub async fn fetch_cached(client: &reqwest::Client, dir: &Path, url: &str) -> Result<PathBuf> {
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -305,6 +376,8 @@ async fn ensure_postgres(paths: &CachePaths, client: &reqwest::Client) -> Result
     Ok(dir.join("bin"))
 }
 
+=======
+>>>>>>> 44b0fe99a9f7450302d170d22d2b7c100a9e9fdd
 /// Ensure the server source is cloned and built at [`SERVER_TAG`], returning the binary path.
 fn ensure_server(paths: &CachePaths) -> Result<PathBuf> {
     let bin = paths.server_bin();
@@ -373,36 +446,10 @@ fn write_stamp(dir: &Path, value: &str) -> Result<()> {
     fs::write(&stamp, value).with_context(|| format!("writing {}", stamp.display()))
 }
 
-/// Hex-encoded SHA-256 of a URL string, used as the download cache key.
-fn url_key(url: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(url.as_bytes());
-    to_hex(hasher.finalize().as_slice())
-}
-
-/// Hex-encoded SHA-256 of a file's contents.
-fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .with_context(|| format!("reading {}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(to_hex(hasher.finalize().as_slice()))
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+/// First executable file named `name` on `PATH`.
+fn which(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
 }

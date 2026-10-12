@@ -7,6 +7,15 @@
 //! created, and freed back to front by [`Session`]'s `Drop`; a failure halfway through leaves a
 //! partially built session that the same `Drop` cleans up, rather than leaking the objects
 //! created before it.
+//!
+//! # The still output
+//!
+//! `take_photo` needs a second chain on the same session: the JPEG reader's window as an
+//! output, and a one-shot request built from `TEMPLATE_STILL_CAPTURE` that targets only it
+//! ([`Session::capture_still`]). The repeating request is left alone while a still is in
+//! flight, so the video stream keeps its cadence. The still chain is optional because the
+//! stream combination is a device property: a camera that refuses the pair is rebuilt without
+//! it, and the photo path then reports the refusal instead of the stream losing its video.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -33,6 +42,12 @@ pub(crate) struct Session {
     target: *mut ACameraOutputTarget,
     /// The session's output, which references the same surface.
     output: *mut ACaptureSessionOutput,
+    /// The one-shot request that fills the still writer's window, when one was given.
+    still_request: *mut ACaptureRequest,
+    /// The still request's target, which references the still window.
+    still_target: *mut ACameraOutputTarget,
+    /// The session's output for the still window.
+    still_output: *mut ACaptureSessionOutput,
     /// The container the session was created from.
     container: *mut ACaptureSessionOutputContainer,
     /// The callbacks the framework keeps a pointer to; they have to outlive the session.
@@ -42,16 +57,20 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    /// Builds the session for one surface and starts streaming into it.
+    /// Builds the session for the encoder surface, plus a still output when one is given, and
+    /// starts streaming into the encoder's.
     ///
     /// `window` is the encoder's input surface: the camera writes straight into it, so no frame
-    /// is copied on its way to the hardware encoder. `fps` is pinned as the auto-exposure target
-    /// range, which is what makes the cadence steady enough for the protocol's segments; whether
-    /// the camera admits to that rate is the caller's business, since it is the side that read
-    /// the capability matrix.
+    /// is copied on its way to the hardware encoder. `still` is the JPEG reader's window, when
+    /// the caller could bring one up; its chain is built here because a session's set of
+    /// outputs is fixed at creation, and it is filled only by [`Session::capture_still`]. `fps`
+    /// is pinned as the auto-exposure target range, which is what makes the cadence steady
+    /// enough for the protocol's segments; whether the camera admits to that rate is the
+    /// caller's business, since it is the side that read the capability matrix.
     pub(crate) fn start(
         device: &mut camera2::Device,
         window: *mut ANativeWindow,
+        still: Option<*mut ANativeWindow>,
         fps: u32,
     ) -> Result<Self, CaptureError> {
         let device_ptr = device
@@ -65,6 +84,9 @@ impl Session {
             request: ptr::null_mut(),
             target: ptr::null_mut(),
             output: ptr::null_mut(),
+            still_request: ptr::null_mut(),
+            still_target: ptr::null_mut(),
+            still_output: ptr::null_mut(),
             container: ptr::null_mut(),
             callbacks: Box::new(ACameraCaptureSession_stateCallbacks {
                 // No shared state yet: the pump reads frames from the encoder, and the camera
@@ -78,12 +100,18 @@ impl Session {
             repeating: false,
         };
 
-        // The output chain: container ← output ← surface.
+        // The output chain: container ← output ← surface, with the still window as a second
+        // output when there is one.
         let container = camera2::output_container_create()?;
         session.container = container;
         let output = camera2::output_create(window)?;
         session.output = output;
         camera2::output_container_add(container, output)?;
+        if let Some(still_window) = still {
+            let still_output = camera2::output_create(still_window)?;
+            session.still_output = still_output;
+            camera2::output_container_add(container, still_output)?;
+        }
 
         // The session, which is created from the container.
         // SAFETY: the device is open, the container is live and the callbacks are owned by
@@ -101,6 +129,19 @@ impl Session {
         session.target = target;
         camera2::request_add_target(request, target)?;
 
+        // The still request, targeting only the still window: it is submitted by
+        // `capture_still` and must not bring the encoder surface into the same request, which
+        // would make the one-shot capture stall the video stream behind its own JPEG.
+        if let Some(still_window) = still {
+            // SAFETY: as for the repeating request above.
+            let still_request =
+                unsafe { camera2::capture_request_create(device_ptr, camera2::TEMPLATE_STILL_CAPTURE) }?;
+            session.still_request = still_request;
+            let still_target = camera2::output_target_create(still_window)?;
+            session.still_target = still_target;
+            camera2::request_add_target(still_request, still_target)?;
+        }
+
         // A constant frame rate: both bounds of the requested range are the configured rate,
         // which is also the one request the metadata header cannot misread in either order.
         camera2::request_set_i32(
@@ -114,8 +155,29 @@ impl Session {
         unsafe { camera2::set_repeating_request(handle, std::slice::from_mut(&mut session.request)) }?;
         session.repeating = true;
 
-        info!(fps, "capture session streaming into the encoder surface");
+        info!(
+            fps,
+            still = !session.still_request.is_null(),
+            "capture session streaming into the encoder surface"
+        );
         Ok(session)
+    }
+
+    /// Submits the one-shot still request, if this session has a still output.
+    ///
+    /// Fails with [`CaptureError::UnsupportedParameters`] when the session was built without
+    /// one, which is what the caller reports through `ack {ok: false}`: the camera refused the
+    /// JPEG output at this geometry, so no still can be produced while the video runs.
+    pub(crate) fn capture_still(&mut self) -> Result<(), CaptureError> {
+        if self.still_request.is_null() {
+            return Err(CaptureError::UnsupportedParameters);
+        }
+        let mut requests = [self.still_request];
+        // SAFETY: the session is live and the still request is owned by `session`, which keeps
+        // it alive until repeating is stopped; its target is one of the session's own outputs.
+        unsafe { camera2::capture_once(self.session, &mut requests) }?;
+        debug!("still capture submitted");
+        Ok(())
     }
 }
 
@@ -150,6 +212,23 @@ impl Drop for Session {
             // SAFETY: as above, for the session output.
             unsafe { camera2::output_free(self.output) };
             self.output = ptr::null_mut();
+        }
+        if !self.still_request.is_null() {
+            // SAFETY: the pointer came from `capture_request_create` and is not used again; the
+            // session that could submit it is already closed.
+            unsafe { camera2::capture_request_free(self.still_request) };
+            self.still_request = ptr::null_mut();
+        }
+        if !self.still_target.is_null() {
+            // SAFETY: as in `target`, for the still window's target.
+            unsafe { camera2::output_target_free(self.still_target) };
+            self.still_target = ptr::null_mut();
+        }
+        if !self.still_output.is_null() {
+            // SAFETY: as in `output`, for the still window's session output. The window itself
+            // belongs to the still reader, which outlives this session.
+            unsafe { camera2::output_free(self.still_output) };
+            self.still_output = ptr::null_mut();
         }
         if !self.container.is_null() {
             // SAFETY: as above, for the container.

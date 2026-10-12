@@ -1,16 +1,21 @@
 //! End-to-end test harness for the SmartClass Webcam client.
 //!
-//! The harness brings up the *real* [`smartclass-webcam-server`] together with its one
-//! hard dependency (PostgreSQL) on a developer workstation and exposes small helpers that
-//! integration tests use to provision a device and drive the management API.
+//! The harness brings up the *real* [`smartclass-webcam-server`] together with a scratch
+//! PostgreSQL cluster on the host, and exposes small helpers that integration tests use to
+//! provision a device and drive the management API.
 //!
-//! Everything expensive is cached under `<workspace>/.cache`:
+//! Host prerequisites:
 //!
-//! - `downloads/<sha256-of-url>` — every downloaded artifact, keyed by URL, so nothing is
-//!   fetched twice and a warm cache lets the tests run offline,
-//! - `services/` — the extracted PostgreSQL distribution,
-//! - `src/` and `bin/` — the cloned server source and its compiled binary,
-//! - `run/` — per-test PostgreSQL data directories, logs and the server's stdout.
+//! - **PostgreSQL 16 or newer** (`initdb`, `pg_ctl`, `createdb`, `postgres`). The harness only
+//!   *locates* these, through `SCWC_PGBIN` when set and otherwise on `PATH`; it never
+//!   downloads a database distribution. On macOS, `brew install postgresql@18` is enough.
+//! - **git** and **go** for the server build.
+//!
+//! Everything the harness builds for itself is cached under `<workspace>/.cache`:
+//!
+//! - `src/` — the cloned server source, stamped with the tag it was cloned at,
+//! - `bin/` — the compiled `smartclass-webcam-server`, rebuilt only when the tag changes,
+//! - `run/` — per-test PostgreSQL data directories, socket directories and logs.
 //!
 //! ```no_run
 //! # async fn demo() -> anyhow::Result<()> {
@@ -36,10 +41,14 @@ mod process;
 mod server;
 
 pub use api::{Device, DeviceCredentials, ManagementApi, Segment, Stream};
+<<<<<<< HEAD
 pub use artifacts::{
     CachePaths, PG_VERSION, SERVER_TAG, ensure_artifacts, pg_archive_url, pg_target, program_name,
     workspace_root,
 };
+=======
+pub use artifacts::{CachePaths, PgBin, SERVER_TAG, ensure_artifacts, workspace_root};
+>>>>>>> 44b0fe99a9f7450302d170d22d2b7c100a9e9fdd
 pub use client::{ClientOptions, ClientProcess, build_cli, spawn_cli};
 pub use env::TestEnv;
 pub use postgres::Postgres;

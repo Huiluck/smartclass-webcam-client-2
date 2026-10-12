@@ -1,4 +1,7 @@
 //! PostgreSQL bring-up: `initdb`, `pg_ctl start`, `createdb`, and the mirror teardown.
+//!
+//! The binaries come from the host (see [`PgBin`]); the *cluster* is scratch state owned by
+//! one test environment.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -6,14 +9,19 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use tracing::info;
 
+<<<<<<< HEAD
 use crate::artifacts::program_name;
+=======
+use crate::artifacts::PgBin;
+>>>>>>> 44b0fe99a9f7450302d170d22d2b7c100a9e9fdd
 
 /// A running PostgreSQL instance owned by one test environment.
 ///
-/// Dropping it runs `pg_ctl -m immediate stop`, so no postmaster outlives the test. The data
-/// directory is wiped and re-initialised on the next start, which keeps runs reproducible.
+/// Dropping it runs `pg_ctl -m immediate stop` and removes its directories, so no postmaster
+/// outlives the test. The data directory is wiped and re-initialised on the next start, which
+/// keeps runs reproducible.
 pub struct Postgres {
-    bin: PathBuf,
+    bin: PgBin,
     data_dir: PathBuf,
     socket_dir: PathBuf,
     port: u16,
@@ -24,7 +32,7 @@ impl Postgres {
     /// Initialise a fresh data directory under `run_dir` and start a server on a scratch port.
     ///
     /// `unique` keeps two concurrently running environments from sharing a data directory.
-    pub fn start(pg_bin: PathBuf, run_dir: &Path, unique: &str, preferred_port: u16) -> Result<Self> {
+    pub fn start(pg_bin: PgBin, run_dir: &Path, unique: &str, preferred_port: u16) -> Result<Self> {
         let data_dir = run_dir.join(format!("pgdata-{unique}"));
         let socket_dir = run_dir.join(format!("pgsock-{unique}"));
         let log = run_dir.join(format!("postgres-{unique}.log"));
@@ -32,7 +40,7 @@ impl Postgres {
         // A previous run may have crashed before its Drop ran; stop that postmaster so the
         // data directory can be wiped.
         if data_dir.join("postmaster.pid").exists() {
-            let _ = pg_ctl(&pg_bin, &data_dir, &log, &["-m", "immediate", "stop"]);
+            let _ = pg_ctl(pg_bin.pg_ctl(), &data_dir, &log, &["-m", "immediate", "stop"]);
         }
         if data_dir.exists() {
             std::fs::remove_dir_all(&data_dir)
@@ -44,7 +52,11 @@ impl Postgres {
             .with_context(|| format!("creating {}", socket_dir.display()))?;
 
         info!(data = %data_dir.display(), "initialising PostgreSQL");
+<<<<<<< HEAD
         let output = Command::new(pg_bin.join(program_name("initdb")))
+=======
+        let output = Command::new(pg_bin.initdb())
+>>>>>>> 44b0fe99a9f7450302d170d22d2b7c100a9e9fdd
             .arg("-D")
             .arg(&data_dir)
             .arg("-U")
@@ -66,7 +78,11 @@ impl Postgres {
             socket_dir.display()
         );
         info!(port, "starting PostgreSQL");
+<<<<<<< HEAD
         let output = Command::new(pg_bin.join(program_name("pg_ctl")))
+=======
+        let output = Command::new(pg_bin.pg_ctl())
+>>>>>>> 44b0fe99a9f7450302d170d22d2b7c100a9e9fdd
             .arg("start")
             .arg("-D")
             .arg(&data_dir)
@@ -89,7 +105,11 @@ impl Postgres {
         }
 
         info!("creating the webcam database");
+<<<<<<< HEAD
         let output = Command::new(pg_bin.join(program_name("createdb")))
+=======
+        let output = Command::new(pg_bin.createdb())
+>>>>>>> 44b0fe99a9f7450302d170d22d2b7c100a9e9fdd
             .arg("-h")
             .arg("127.0.0.1")
             .arg("-p")
@@ -119,7 +139,10 @@ impl Postgres {
 
     /// Connection string for `WEBCAM_DB_URL`; local trust auth needs no password.
     pub fn dsn(&self) -> String {
-        format!("postgres://postgres@127.0.0.1:{}/webcam?sslmode=disable", self.port)
+        format!(
+            "postgres://postgres@127.0.0.1:{}/webcam?sslmode=disable",
+            self.port
+        )
     }
 
     /// Path of the postmaster log, useful when startup assertions fail.
@@ -131,7 +154,7 @@ impl Postgres {
 impl Drop for Postgres {
     fn drop(&mut self) {
         let _ = pg_ctl(
-            &self.bin,
+            self.bin.pg_ctl(),
             &self.data_dir,
             &self.log,
             &["-m", "immediate", "stop"],
@@ -142,8 +165,13 @@ impl Drop for Postgres {
     }
 }
 
+<<<<<<< HEAD
 fn pg_ctl(bin: &Path, data_dir: &Path, log: &Path, action: &[&str]) -> Result<()> {
     let output = Command::new(bin.join(program_name("pg_ctl")))
+=======
+fn pg_ctl(pg_ctl: &Path, data_dir: &Path, log: &Path, action: &[&str]) -> Result<()> {
+    let output = Command::new(pg_ctl)
+>>>>>>> 44b0fe99a9f7450302d170d22d2b7c100a9e9fdd
         .arg("-D")
         .arg(data_dir)
         .arg("-l")

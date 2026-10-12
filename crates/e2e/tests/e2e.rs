@@ -1,8 +1,8 @@
 //! End-to-end tests: a real PostgreSQL, a real smartclass-webcam-server, a real client.
 //!
-//! Run with `cargo test -p scwc-e2e`. The first run downloads the PostgreSQL distribution,
-//! clones and builds the server, and compiles the client; later runs reuse `.cache` and are
-//! a few seconds of process startup.
+//! Run with `cargo test -p scwc-e2e`. PostgreSQL must be installed on the host (see the crate
+//! docs); the first run clones and builds the server into `.cache`, later runs go straight to
+//! process startup.
 
 use std::time::Duration;
 
