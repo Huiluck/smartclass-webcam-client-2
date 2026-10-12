@@ -17,3 +17,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
+
+# iOS fix: backtrace's apple "libs_macos" code calls libc's `_dyld_*` functions,
+# which libc now only exposes on macOS (it gates them with target_os = "macos").
+# The vendored copy declares them as plain externs instead; see the
+# SCWC PATCH comment in third_party/backtrace/src/symbolize/gimli/libs_macos.rs.
+# Drop this once rust-lang/backtrace-rs supports non-macOS Apple targets.
+[patch.crates-io]
+backtrace = { path = "../../third_party/backtrace" }
