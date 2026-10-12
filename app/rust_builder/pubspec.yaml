@@ -25,10 +25,10 @@ flutter:
       android:
         ffiPlugin: true
       ios:
-        ffiPlugin: true
+        pluginClass: ScwcPreviewPlugin
       linux:
-        ffiPlugin: true
+        pluginClass: ScwcPreviewPlugin
       macos:
         pluginClass: ScwcPreviewPlugin
       windows:
-        ffiPlugin: true
+        pluginClass: ScwcPreviewPlugin

@@ -51,8 +51,9 @@ use windows::Win32::Graphics::Imaging::{
     IWICBitmapFrameEncode, IWICImagingFactory, IWICStream, WICBitmapEncoderNoCache,
 };
 use windows::Win32::Media::MediaFoundation::{
-    ICodecAPI, IMFActivate, IMFAttributes, IMFMediaSource, IMFMediaType, IMFSample,
-    IMFSourceReader, IMFTransform, MFCreateAttributes, MFCreateMediaType, MFCreateMemoryBuffer,
+    ICodecAPI, IMFActivate, IMFAttributes, IMFMediaBuffer, IMFMediaSource, IMFMediaType,
+    IMFSample, IMFSourceReader, IMFTransform, MFCreateAttributes, MFCreateMediaType,
+    MFCreateMemoryBuffer,
     MFCreateSample, MFCreateSourceReaderFromMediaSource, MFEnumDeviceSources,
     MFTEnumEx, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE,
     MFT_ENUM_FLAG_LOCALMFT, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
@@ -612,9 +613,9 @@ impl Pipeline {
         user: *mut c_void,
     ) -> Result<(), CaptureError> {
         self.capture_still(sample);
-        // The preview comes from the frame the photo path just kept, which is the one the
-        // encoder is about to be given: what the interface shows is what is being recorded.
-        self.publish_preview();
+        // The preview comes from the frame the encoder is about to be given, so what the interface
+        // shows is what is being recorded.
+        self.publish_preview(sample);
         if !self.should_submit(sample) {
             return Ok(());
         }
@@ -685,21 +686,34 @@ impl Pipeline {
 
     /// Offers the newest camera frame to the live preview.
     ///
-    /// Built from the copy the photo path keeps rather than from the reader's own buffer, which
-    /// the source recycles. Nothing is converted while no preview is wanted, and what is converted
-    /// is the size the sink asked for, so a preview never pays for the whole frame.
-    fn publish_preview(&mut self) {
-        let Some(still) = self.still.as_ref().filter(|still| !still.data.is_empty()) else {
-            return;
-        };
+    /// The frame the camera just handed over is converted straight to the size the consumer asked
+    /// for, while it is locked and before the reader recycles it. Nothing is converted while no
+    /// preview is wanted, and what is converted is the picture as it will be shown rather than a
+    /// full-resolution frame the core would then have to scale — so a preview costs one scaled
+    /// conversion and no copy of its own.
+    fn publish_preview(&mut self, sample: &IMFSample) {
         let Some((out_width, out_height)) =
-            scwc_core::preview::next_frame_size(still.width, still.height)
+            scwc_core::preview::next_frame_size(self.width, self.height)
         else {
             return;
         };
-        match still.to_bgra(out_width, out_height, &mut self.preview) {
+        let frame = match LockedFrame::lock(sample) {
+            Ok(frame) => frame,
+            Err(failure) => {
+                warn!(error = %failure, "cannot read the camera frame for the preview");
+                return;
+            }
+        };
+        let view = FrameView {
+            data: frame.bytes(),
+            width: self.width,
+            height: self.height,
+            stride: self.stride,
+            format: self.format,
+        };
+        match view.convert::<4>(out_width as usize, out_height as usize, &mut self.preview) {
             Ok(()) => scwc_core::preview::publish_bgra(&self.preview, out_width, out_height),
-            Err(error) => warn!(%error, "could not build the preview frame"),
+            Err(failure) => warn!(error = %failure, "cannot build the preview frame"),
         }
     }
 
@@ -1032,20 +1046,50 @@ impl StillFrame {
         Ok(bgr)
     }
 
-    /// Converts the frame to the packed, top-down BGRA the live preview wants, at the size it is
-    /// wanted at, replacing the contents of `bgra`.
-    ///
-    /// The size comes from the preview sink, so what is built here is the picture as it will be
-    /// shown, not a full-resolution frame that the core would then have to scale.
-    fn to_bgra(
+    /// Converts the frame into a packed, top-down buffer of `CHANNELS` bytes per pixel at
+    /// `out_width`x`out_height`, replacing its contents; the fourth channel, when asked for, is
+    /// opaque.
+    fn convert<const CHANNELS: usize>(
         &self,
-        out_width: u32,
-        out_height: u32,
-        bgra: &mut Vec<u8>,
+        out_width: usize,
+        out_height: usize,
+        out: &mut Vec<u8>,
     ) -> Result<(), CaptureError> {
-        self.convert::<4>(out_width as usize, out_height as usize, bgra)
+        self.view().convert::<CHANNELS>(out_width, out_height, out)
     }
 
+    /// The frame as the view the conversion reads.
+    fn view(&self) -> FrameView<'_> {
+        FrameView {
+            data: &self.data,
+            width: self.width,
+            height: self.height,
+            stride: self.stride,
+            format: self.format,
+        }
+    }
+}
+
+/// One camera frame's pixels, with the layout they arrived in.
+///
+/// A borrowed view: the photo path keeps its own copy of every frame ([`StillFrame`]), and the live
+/// preview converts the frame the camera just handed over without copying it first — the source
+/// reader recycles its buffers, which is what makes the copy the photo's price and not the
+/// preview's.
+struct FrameView<'a> {
+    /// The frame's bytes, as the camera delivered them.
+    data: &'a [u8],
+    /// Frame width in pixels.
+    width: u32,
+    /// Frame height in pixels.
+    height: u32,
+    /// Bytes per row, negative for a bottom-up frame.
+    stride: i32,
+    /// The layout of the bytes.
+    format: PixelFormat,
+}
+
+impl FrameView<'_> {
     /// Converts the frame into a packed, top-down buffer of `CHANNELS` bytes per pixel at
     /// `out_width`x`out_height`, replacing its contents; the fourth channel, when asked for, is
     /// opaque.
@@ -1143,6 +1187,63 @@ impl StillFrame {
             }
         }
         Ok(())
+    }
+}
+
+/// One camera sample's pixels, locked for as long as the guard lives.
+///
+/// The source reader recycles its buffers as soon as the sample is released, so a frame's bytes are
+/// only valid while its buffer is locked: the conversion reads them inside the guard, and nothing
+/// outlives it.
+struct LockedFrame {
+    /// The locked buffer, unlocked when this guard goes.
+    buffer: IMFMediaBuffer,
+    /// The first byte of the frame.
+    data: *const u8,
+    /// How many bytes the frame holds.
+    length: usize,
+}
+
+impl LockedFrame {
+    /// Locks one sample's buffer and borrows its bytes.
+    ///
+    /// The sample is made contiguous first, exactly as the encoded path does it: a camera frame that
+    /// arrives in several buffers still reads as one run of bytes.
+    fn lock(sample: &IMFSample) -> Result<Self, CaptureError> {
+        // SAFETY: the sample is live; the contiguous buffer is owned by the guard.
+        let buffer = unsafe { sample.ConvertToContiguousBuffer() }
+            .map_err(capture_error("reading a camera frame"))?;
+        let mut data = ptr::null_mut();
+        let mut length = 0u32;
+        // SAFETY: the buffer is live and the out parameters are locals.
+        unsafe { buffer.Lock(&mut data, None, Some(&mut length)) }
+            .map_err(capture_error("locking a camera frame"))?;
+        if data.is_null() {
+            return Err(CaptureError::Os(
+                "the camera frame holds no pixels".to_owned(),
+            ));
+        }
+        Ok(Self {
+            buffer,
+            data,
+            length: length as usize,
+        })
+    }
+
+    /// The frame's bytes, readable while the guard lives.
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: the buffer is locked for as long as the guard is alive, and a locked buffer is
+        // readable for the length the lock reported.
+        unsafe { slice::from_raw_parts(self.data, self.length) }
+    }
+}
+
+impl Drop for LockedFrame {
+    fn drop(&mut self) {
+        // SAFETY: the buffer was locked in `lock` and is unlocked once, here.
+        if let Err(failure) = unsafe { self.buffer.Unlock() } {
+            warn!(code = ?failure.code(), "cannot unlock a camera frame");
+        }
     }
 }
 

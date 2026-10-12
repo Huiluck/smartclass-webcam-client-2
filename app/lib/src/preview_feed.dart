@@ -47,12 +47,14 @@ class PreviewFeed extends ChangeNotifier {
   bool _sourcing = false;
   bool _sourceAgain = false;
 
-  /// The shape of the picture the pipeline produces, measured from the buffer the platform paints.
+  /// The shape of the picture the pipeline produces, measured from the frame the platform paints.
   ///
-  /// The platform's texture paints the camera's buffer and Flutter scales it to whatever box it is
-  /// given, so the aspect ratio is the one thing the interface must know about a picture the Rust
-  /// side never converts — and a camera may negotiate a size other than the one it was asked for,
-  /// which is why the platform's own answer is preferred over the configured resolution.
+  /// The texture paints a frame of the camera's shape — the camera's own buffer on the Apple
+  /// platforms, the scaled frame the capture path published on Linux and Windows — and Flutter scales
+  /// it to whatever box it is given, so its aspect ratio is the one thing the interface must know
+  /// about a picture that never arrives here as a decoded image. A camera may negotiate a size other
+  /// than the one it was asked for, which is why the platform's own answer is preferred over the
+  /// configured resolution.
   double? _sourceRatio;
 
   /// The newest frame of the pipeline the feed follows, or null while there is none to show.

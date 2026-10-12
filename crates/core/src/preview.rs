@@ -15,18 +15,25 @@
 //! the buffer itself — it is an opaque pointer here — so the platforms keep their own retain and
 //! release.
 //!
+//! A platform whose renderer takes plain pixels gets the same frames without the bridge
+//! ([`set_rgba_frame_listener`], [`take_rgba_frame`]): the newest finished frame waits in the slot
+//! of [`publish_rgba_frame`] for the texture to paint it, and the slot holds it — one frame, never
+//! a queue — until the texture takes it or a newer frame replaces it. That is the stream path's own
+//! work at the stream path's own size, with the consumer being a texture instead of a bridge.
+//!
 //! The RGBA path is consumer-paced. [`next_frame_size`] hands out the size of the next frame only
-//! while the consumer is ready for it — no sink, no target box, or a frame the consumer has not
-//! reported through [`preview_frame_consumed`] all mean no frame at all — so a producer never
-//! renders, converts or scales anything a consumer cannot keep up with. The Apple shim renders at
-//! exactly that size, which is what keeps a preview from ever costing the full capture
-//! resolution. The native path needs no pacing: the consumer renders the newest buffer whenever
-//! it likes, and the frames it misses cost a retain and a release.
+//! while the consumer is ready for it — no sink, no target box, a texture nobody takes frames from,
+//! or a frame the consumer has not reported through [`preview_frame_consumed`] all mean no frame at
+//! all — so a producer never renders, converts or scales anything a consumer cannot keep up with.
+//! The Apple shim renders at exactly that size, which is what keeps a preview from ever costing the
+//! full capture resolution. The native path needs no pacing: the consumer renders the newest buffer
+//! whenever it likes, and the frames it misses cost a retain and a release.
 //!
 //! Nothing on either path can fail the capture: a frame nobody consumes is dropped, and no frame
 //! is produced at all while the consumer shows no preview.
 
 use std::ffi::c_void;
+use std::mem::replace;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -78,6 +85,41 @@ static NATIVE_LISTENER: Mutex<Option<fn()>> = Mutex::new(None);
 /// callback can ask without taking a lock on every frame.
 static NATIVE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// The newest finished frame published for a pixel-buffer texture, or null while there is none.
+///
+/// Opaque here on purpose, like [`NATIVE_FRAME`]: the frame is a [`PreviewFrame`] boxed by
+/// [`publish_rgba_frame`], and freeing a box is the consumer's business — this module only swaps one
+/// pointer for another, which is what keeps a texture's read of the slot free of locks.
+static RGBA_FRAME: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+
+/// The pixel-buffer texture consumer: the code told when a frame is published, and the owner of the
+/// frames the slot holds.
+static RGBA_CONSUMER: Mutex<Option<RgbaFrameConsumer>> = Mutex::new(None);
+
+/// Whether a pixel-buffer texture consumer is registered, mirrored out of the mutex for the capture
+/// path's per-frame question.
+static RGBA_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// The consumer of the frames published for a pixel-buffer texture.
+///
+/// The frames are boxed [`PreviewFrame`]s, and the slot hands them over whole: the consumer is the
+/// code that knows how to free them, so it is the code that owns the slot's allocations. Both hooks
+/// are plain function pointers rather than closures, so that a capture callback can reach them
+/// without owning anything.
+#[derive(Clone, Copy)]
+pub struct RgbaFrameConsumer {
+    /// Called once per published frame, from the thread that captured it.
+    ///
+    /// A texture's answer is a "repaint me" notice, so it must return promptly.
+    pub ready: fn(),
+    /// Frees one frame the slot hands over.
+    ///
+    /// The pointer is the one [`publish_rgba_frame`] published — a `Box<PreviewFrame>` — and the
+    /// consumer releases it exactly once: when a published frame is replaced before it is taken, and
+    /// when the consumer stops with a frame still in the slot.
+    pub release: fn(*mut c_void),
+}
+
 /// Registers the sink the live preview is offered to; `None` stops it.
 ///
 /// Replacing a sink drops the previous one, which ends the receiver its consumer awaits, and
@@ -100,13 +142,14 @@ pub fn set_preview_target_size(width: u32, height: u32) {
     arm();
 }
 
-/// Whether a preview is configured at all: a sink is registered and a target size is set.
+/// Whether a preview is configured at all: a target size is set and something shows the picture —
+/// a sink, or a pixel-buffer texture that paints frames produced for it.
 ///
 /// This says nothing about whether a frame may be produced *now* — a consumer that has not
 /// reported the frame it was handed is behind — so a producer asks [`next_frame_size`] rather
 /// than this.
 pub fn preview_enabled() -> bool {
-    target_size().is_some() && sink_slot().is_some()
+    target_size().is_some() && (sink_slot().is_some() || rgba_preview_active())
 }
 
 /// The size to render the next frame at, or `None` when no frame may be produced now.
@@ -138,12 +181,17 @@ pub fn preview_frame_consumed() {
     arm();
 }
 
-/// Converts one captured frame and offers it to the sink.
+/// Converts one captured frame and offers it to the consumer.
 ///
 /// `pixels` is the frame as the backend hands it over: tightly packed BGRA, four bytes per
 /// pixel, row-major, `width * height` of them. The frame is scaled aspect-locked into the
 /// target size, its channels swapped to RGBA, and offered without waiting — a caller that is
 /// behind loses this frame instead of holding up the capture.
+///
+/// The frame goes to the pixel-buffer texture while one is registered, and to the sink otherwise:
+/// both want the same picture at the same size, and a texture is only registered while the
+/// application paints what it says — the two paths are alternatives, and the texture's is the
+/// cheaper one.
 ///
 /// Does nothing while no frame may be produced — see [`next_frame_size`] — which is what lets a
 /// producer call this unconditionally.
@@ -154,27 +202,46 @@ pub fn publish_bgra(pixels: &[u8], width: u32, height: u32) {
     let Some(source) = Bgra::new(pixels, width, height) else {
         return;
     };
-    // Cloned out of the slot before the conversion, so the lock is held only long enough to
-    // look: a caller that stops listening (the sink was replaced, or the run ended) neither
-    // waits for a frame being converted nor pays for one it will never see.
-    let Some(sender) = sink_slot().as_ref().cloned() else {
-        return;
+    // Read before the conversion, so nothing is produced for a texture that went away — and the
+    // sink is only looked at when the texture is not the consumer, so its lock is never taken on
+    // the texture path.
+    let texture = rgba_preview_active();
+    let sink = if texture {
+        None
+    } else {
+        // Cloned out of the slot before the conversion, so the lock is held only long enough to
+        // look: a caller that stops listening (the sink was replaced, or the run ended) neither
+        // waits for a frame being converted nor pays for one it will never see.
+        sink_slot().as_ref().cloned()
     };
+    if sink.is_none() && !texture {
+        return;
+    }
     // The frame is a frame, so it takes the consumer's permit — and gives it back only when the
-    // consumer reports it. Until then, nothing more is produced for it, exactly as if the queue
-    // were full.
+    // consumer reports it, by taking it or through [`preview_frame_consumed`]. Until then, nothing
+    // more is produced for it, exactly as if the queue were full.
     if !consume_permit() {
         return;
     }
 
     let (out_width, out_height) = fit(source.width, source.height, target_width, target_height);
     let rgba = source.scale_to(out_width, out_height);
-    // The channel is unbounded, so this only fails once the consumer is gone.
-    let _ = sender.send(PreviewFrame {
+    let frame = PreviewFrame {
         rgba,
         width: out_width,
         height: out_height,
-    });
+    };
+    if texture {
+        if let Some(replaced) = publish_rgba_frame(frame) {
+            // A frame the texture never took: the slot kept it, and the consumer is what frees it.
+            release_rgba_frame(replaced);
+        }
+        return;
+    }
+    // The channel is unbounded, so this only fails once the consumer is gone.
+    if let Some(sender) = sink {
+        let _ = sender.send(frame);
+    }
 }
 
 /// Registers the consumer told when a new native frame is published; `None` stops it.
@@ -231,6 +298,79 @@ pub fn take_native_frame() -> Option<*mut c_void> {
 /// The listener slot, with a poisoned lock treated as an empty one.
 fn listener_slot() -> MutexGuard<'static, Option<fn()>> {
     NATIVE_LISTENER.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+/// Registers the consumer of the frames published for a pixel-buffer texture; `None` stops it.
+///
+/// A registered consumer is what makes the capture path produce a preview at all where nothing is
+/// subscribed to the sink, which is the point: the frames are the same ones, converted and scaled
+/// once, for a texture to paint instead of for a bridge to carry. The frames in the slot when a
+/// consumer goes are handed back to it to free — nothing may paint them, and this module does not
+/// own them.
+pub fn set_rgba_frame_listener(consumer: Option<RgbaFrameConsumer>) {
+    let previous = replace(&mut *consumer_slot(), consumer);
+    RGBA_ACTIVE.store(consumer.is_some(), Ordering::Release);
+    if let Some(previous) = previous {
+        if let Some(frame) = clear_rgba_frame() {
+            (previous.release)(frame);
+        }
+    }
+}
+
+/// Whether a consumer of pixel-buffer frames is registered.
+///
+/// Cheap enough for a capture callback to check per frame, and the question a producer asks before
+/// it converts anything for a texture nobody paints.
+pub fn rgba_preview_active() -> bool {
+    RGBA_ACTIVE.load(Ordering::Acquire)
+}
+
+/// Publishes `frame` as the newest pixel-buffer frame, returning the one it replaced.
+///
+/// The frame is boxed here and handed over as an opaque pointer, because the consumer frees it: a
+/// `Some` answer is the frame this publish replaced, which the registered consumer's `release` hook
+/// gets when [`publish_bgra`] is what published. The registered listener, if any, is told once.
+pub fn publish_rgba_frame(frame: PreviewFrame) -> Option<*mut c_void> {
+    let frame = Box::into_raw(Box::new(frame)).cast::<c_void>();
+    let replaced = RGBA_FRAME.swap(frame, Ordering::AcqRel);
+    let consumer = *consumer_slot();
+    if let Some(consumer) = consumer {
+        (consumer.ready)();
+    }
+    (!replaced.is_null()).then_some(replaced)
+}
+
+/// Takes the newest pixel-buffer frame for the consumer, which owns it from here on.
+///
+/// The read is what the pacing waits for, exactly as [`preview_frame_consumed`] is on the stream
+/// path: a producer may publish one more frame from here on, and nothing is converted for a texture
+/// that paints less often than the camera captures. `None` means no frame has been published since
+/// the last one was taken — a texture paints the frame it holds again rather than clearing itself.
+pub fn take_rgba_frame() -> Option<*mut c_void> {
+    let frame = RGBA_FRAME.swap(ptr::null_mut(), Ordering::AcqRel);
+    if frame.is_null() {
+        return None;
+    }
+    arm();
+    Some(frame)
+}
+
+/// Empties the slot without arming a frame, for a consumer that stops.
+fn clear_rgba_frame() -> Option<*mut c_void> {
+    let frame = RGBA_FRAME.swap(ptr::null_mut(), Ordering::AcqRel);
+    (!frame.is_null()).then_some(frame)
+}
+
+/// Frees one frame the slot replaced, through the consumer that owns the allocation.
+fn release_rgba_frame(frame: *mut c_void) {
+    if let Some(consumer) = *consumer_slot() {
+        (consumer.release)(frame);
+    }
+}
+
+/// The texture-consumer slot, with a poisoned lock treated as an empty one.
+fn consumer_slot() -> MutexGuard<'static, Option<RgbaFrameConsumer>> {
+    RGBA_CONSUMER.lock().unwrap_or_else(|error| error.into_inner())
 }
 
 /// Arms the next frame: nothing is in flight, so one more may be produced.
@@ -335,9 +475,12 @@ fn sink_slot() -> MutexGuard<'static, Option<UnboundedSender<PreviewFrame>>> {
 mod tests {
     use super::{
         fit, native_frame, native_preview_active, next_frame_size, preview_enabled,
-        preview_frame_consumed, publish_bgra, publish_native_frame, set_native_frame_listener,
-        set_preview_sink, set_preview_target_size, take_native_frame, PreviewFrame,
+        preview_frame_consumed, publish_bgra, publish_native_frame, rgba_preview_active,
+        set_native_frame_listener, set_preview_sink, set_preview_target_size,
+        set_rgba_frame_listener, take_native_frame, take_rgba_frame, PreviewFrame,
+        RgbaFrameConsumer,
     };
+    use std::ffi::c_void;
     use std::ptr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc::UnboundedReceiver;
@@ -357,6 +500,10 @@ mod tests {
         // The frames these tests publish are invented pointers, and the platform that would own
         // their references is not here, so the slot is simply emptied.
         take_native_frame();
+        // A texture consumer is cleared through its own hook, which is what frees the frame the
+        // slot still holds; the previous test's counter is what that costs, not a leak.
+        set_rgba_frame_listener(None);
+        take_rgba_frame();
         guard
     }
 
@@ -529,5 +676,64 @@ mod tests {
         assert_eq!(publish_native_frame(first), None);
         assert_eq!(NOTIFIED.load(Ordering::Relaxed), 2, "no listener, no notice");
         assert_eq!(take_native_frame(), Some(first));
+    }
+
+    #[test]
+    fn a_texture_consumer_is_a_consumer_like_any_other() {
+        let _guard = exclusive();
+        static READY: AtomicUsize = AtomicUsize::new(0);
+        static RELEASED: AtomicUsize = AtomicUsize::new(0);
+        fn ready() {
+            READY.fetch_add(1, Ordering::Relaxed);
+        }
+        fn release(_frame: *mut c_void) {
+            RELEASED.fetch_add(1, Ordering::Relaxed);
+        }
+        let source = [0u8; 4 * 2 * 4];
+
+        // A texture and a sink are the same kind of consumer, so a texture alone is a preview:
+        // that is what makes the capture path produce frames for it with nothing subscribed.
+        set_preview_target_size(8, 8);
+        assert!(!preview_enabled(), "no consumer and no texture is no preview");
+        assert_eq!(next_frame_size(4, 2), None);
+
+        set_rgba_frame_listener(Some(RgbaFrameConsumer { ready, release }));
+        assert!(rgba_preview_active());
+        assert!(preview_enabled(), "a texture is what the frames are for");
+        assert_eq!(next_frame_size(4, 2), Some((8, 4)));
+
+        publish_bgra(&source, 4, 2);
+        assert_eq!(READY.load(Ordering::Relaxed), 1, "the texture was told");
+        let first = take_rgba_frame().expect("the frame the texture paints");
+        assert_eq!(take_rgba_frame(), None, "a frame is handed out once");
+        assert_eq!(next_frame_size(4, 2), Some((8, 4)), "taking is the report");
+
+        publish_bgra(&source, 4, 2);
+        let second = take_rgba_frame().expect("the frame after it");
+        assert_ne!(first, second, "a newer frame is its own frame");
+        assert_eq!(RELEASED.load(Ordering::Relaxed), 0, "both were taken");
+
+        // The slot keeps one frame: a newer frame replaces the one nobody took, and the replaced
+        // frame goes back to the consumer to free.
+        publish_bgra(&source, 4, 2);
+        preview_frame_consumed();
+        publish_bgra(&source, 4, 2);
+        assert_eq!(RELEASED.load(Ordering::Relaxed), 1, "the replaced frame went");
+        assert!(take_rgba_frame().is_some(), "the newest frame was waiting");
+
+        // Stopping hands the frame in the slot back and stops the path.
+        publish_bgra(&source, 4, 2);
+        set_rgba_frame_listener(None);
+        assert!(!rgba_preview_active());
+        assert_eq!(RELEASED.load(Ordering::Relaxed), 2, "the last frame went");
+        assert_eq!(take_rgba_frame(), None);
+        assert!(!preview_enabled(), "no consumer, no preview");
+        set_preview_target_size(8, 8);
+        publish_bgra(&source, 4, 2);
+        assert_eq!(
+            RELEASED.load(Ordering::Relaxed),
+            2,
+            "nothing is produced once the texture is gone"
+        );
     }
 }

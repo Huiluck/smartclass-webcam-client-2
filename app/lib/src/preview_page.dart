@@ -1,6 +1,7 @@
 import 'package:app/src/agent_state.dart';
 import 'package:app/src/preview_feed.dart';
 import 'package:app/src/rust/api.dart';
+import 'package:app/src/preview_texture.dart';
 import 'package:flutter/material.dart';
 
 /// The main page: the live camera picture and the agent's status.
@@ -56,7 +57,7 @@ class PreviewView extends StatefulWidget {
 class _PreviewViewState extends State<PreviewView> {
   int? _width;
   int? _height;
-  bool _textured = false;
+  bool _ownBuffer = false;
 
   @override
   void dispose() {
@@ -68,17 +69,18 @@ class _PreviewViewState extends State<PreviewView> {
   /// Asks the client to scale frames to `width` x `height` pixels, once per size and source.
   ///
   /// A plain bridge call, not framework state: it only changes what the Rust side sends next. While
-  /// the platform paints the camera's own buffer there is no frame path to size, so the capture
-  /// path is told `0x0` — and the layout size goes back with the stream as soon as the picture comes
-  /// from it again.
-  void _setTargetSize(int width, int height, {required bool textured}) {
-    if (width == _width && height == _height && textured == _textured) return;
+  /// the platform paints the camera's own buffer there is no frame path to size, so the capture path
+  /// is told `0x0` — and the layout size goes back with the stream as soon as the picture comes from
+  /// it again. A texture that paints a frame the capture path produced is the frame path, so it keeps
+  /// the layout size: that frame is scaled to exactly this box before it is handed to Flutter.
+  void _setTargetSize(int width, int height, {required bool ownBuffer}) {
+    if (width == _width && height == _height && ownBuffer == _ownBuffer) return;
     _width = width;
     _height = height;
-    _textured = textured;
+    _ownBuffer = ownBuffer;
     setPreviewTargetSize(
-      width: textured ? 0 : width,
-      height: textured ? 0 : height,
+      width: ownBuffer ? 0 : width,
+      height: ownBuffer ? 0 : height,
     );
   }
 
@@ -99,7 +101,10 @@ class _PreviewViewState extends State<PreviewView> {
               _setTargetSize(
                 (constraints.maxWidth * ratio).round(),
                 (constraints.maxHeight * ratio).round(),
-                textured: textureId != null,
+                // A texture that paints the platform's own buffer is fed by no frame of ours; one
+                // that paints a frame the capture path produced is sized by this box like the
+                // stream's frames are.
+                ownBuffer: textureId != null && PreviewTexture.paintsPlatformBuffer,
               );
               if (textureId != null) {
                 // The platform paints the camera's own buffer, so the widget only has to give it a

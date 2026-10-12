@@ -132,7 +132,7 @@ use unsupported as sys;
 
 pub use crate::error::CaptureError;
 pub use crate::source::{CaptureSource, open};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use crate::source::{release_frame_buffer, retain_frame_buffer};
 
 /// Lists the cameras of the host.

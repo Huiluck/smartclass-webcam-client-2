@@ -68,7 +68,7 @@ pub(crate) unsafe extern "C" fn on_native_frame(_user: *mut c_void, buffer: *mut
 /// retained that way.
 ///
 /// A buffer that is null is returned unchanged, so callers need no null check.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub unsafe fn retain_frame_buffer(buffer: *mut c_void) -> *mut c_void {
     // SAFETY: the caller upholds the contract above.
     unsafe { sys::retain_buffer(buffer) }
@@ -83,7 +83,7 @@ pub unsafe fn retain_frame_buffer(buffer: *mut c_void) -> *mut c_void {
 /// after this returns.
 ///
 /// A buffer that is null is ignored, so callers need no null check.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub unsafe fn release_frame_buffer(buffer: *mut c_void) {
     // SAFETY: the caller upholds the contract above.
     unsafe { sys::release_buffer(buffer) };
