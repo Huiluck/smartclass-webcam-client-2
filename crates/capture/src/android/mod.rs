@@ -27,15 +27,23 @@
 //! protocol lets a device move neither `resolution` nor `fps` without an operator command (see
 //! [`thermal`]).
 //!
-//! All of that has since run on hardware — a vivo V2405A (MediaTek, Android 16) through the
-//! Flutter shell, which is the context a device client actually runs in:
+//! Everything the core can ask of a camera is wired, and most of it has run on hardware — a
+//! vivo V2405A (MediaTek, Android 16) through the Flutter shell, which is the context a device
+//! client actually runs in:
 //!
 //! - **Streaming**: registered and attached, then sent 1280x720@60 H.264 from the hardware
-//!   encoder for minutes with `dropped 0` in the core's counters.
-//! - **`switch_camera`**: the server moved the camera to 640x480@30; the session and encoder
-//!   were rebuilt on the same open device and frames kept flowing afterwards.
+//!   encoder for minutes with `dropped 0` in the core's counters, and later 3840x2160@60 —
+//!   which the server's own bookkeeping confirms at 90 frames per 1500 ms segment (60.0 fps)
+//!   and ~11.3 MB per segment (~60 Mbps).
+//! - **`switch_camera`**: the server moved the camera to 640x480@30 and then to 3840x2160@60;
+//!   the session and encoder were rebuilt on the same open device each time and frames kept
+//!   flowing afterwards.
 //! - **`take_photo`**: a still came back as a 210 KB `image/jpeg` carrying the `request_id` of
 //!   the command that asked for it.
+//! - **Thermal step-down**: not exercised. The monitor starts and reports `nominal` on this
+//!   device, but no run has produced a thermal transition, so the step-down itself is still
+//!   only reasoned-about code; proving it needs either a device under real heat or an injected
+//!   status.
 //!
 //! # Why a run from `adb shell` says nothing about this backend
 //!

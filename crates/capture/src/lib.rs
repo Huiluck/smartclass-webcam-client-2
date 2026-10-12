@@ -26,8 +26,10 @@
 //! - **Android**: the Camera2 NDK for capture and `AMediaCodec` for encoding, both reached
 //!   through hand-written FFI like the Linux backend, so no shim is compiled either.
 //!   Enumeration reports each camera's real capability matrix, and the media path carries
-//!   `switch_camera` rebuilds, stills through a JPEG reader and a thermal encoder step-down —
-//!   all three verified on hardware through the Flutter shell. The `CAMERA` permission is held
+//!   `switch_camera` rebuilds, stills through a JPEG reader and a thermal encoder step-down.
+//!   Streaming (up to 4K60), `switch_camera` and `take_photo` are verified on hardware through
+//!   the Flutter shell; the thermal step-down has only run in a nominal state — it needs a real
+//!   thermal transition to fire, which no run has produced yet. The `CAMERA` permission is held
 //!   per process on this platform: an installed app gets it from the user, while a native
 //!   binary run from `adb shell` is at the mercy of the vendor's own policy, which on one
 //!   vendor's devices means its camera HAL aborts on such a client's first request (the
