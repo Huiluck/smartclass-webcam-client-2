@@ -217,6 +217,15 @@ impl Handle {
         }
     }
 
+    /// Whether a consumer is reading frames.
+    ///
+    /// Accepted and ignored: this backend's pump encodes every frame the reader hands it, so a
+    /// camera with no stream keeps paying for the encoder here too. The flag exists so the core
+    /// can drive every platform the same way; gating this pump is a change to its own loop, with
+    /// a forced IDR on the way back on, which is not something that can be checked on a machine
+    /// that cannot run it.
+    pub(crate) fn set_encoding(&self, _enabled: bool) {}
+
     /// Rebuilds the pipeline with new capture and encoder parameters.
     pub(crate) fn set_parameters(
         &self,
@@ -677,17 +686,19 @@ impl Pipeline {
     /// Offers the newest camera frame to the live preview.
     ///
     /// Built from the copy the photo path keeps rather than from the reader's own buffer, which
-    /// the source recycles. Nothing is converted while no preview is wanted: the conversion is a
-    /// whole-frame pass.
+    /// the source recycles. Nothing is converted while no preview is wanted, and what is converted
+    /// is the size the sink asked for, so a preview never pays for the whole frame.
     fn publish_preview(&mut self) {
-        if !scwc_core::preview::preview_enabled() {
-            return;
-        }
         let Some(still) = self.still.as_ref().filter(|still| !still.data.is_empty()) else {
             return;
         };
-        match still.to_bgra(&mut self.preview) {
-            Ok(()) => scwc_core::preview::publish_bgra(&self.preview, still.width, still.height),
+        let Some((out_width, out_height)) =
+            scwc_core::preview::next_frame_size(still.width, still.height)
+        else {
+            return;
+        };
+        match still.to_bgra(out_width, out_height, &mut self.preview) {
+            Ok(()) => scwc_core::preview::publish_bgra(&self.preview, out_width, out_height),
             Err(error) => warn!(%error, "could not build the preview frame"),
         }
     }
@@ -1017,24 +1028,44 @@ impl StillFrame {
     /// Converts the frame to the packed, top-down 24-bit BGR the JPEG encoder takes.
     fn to_bgr(&self) -> Result<Vec<u8>, CaptureError> {
         let mut bgr = Vec::new();
-        self.convert::<3>(&mut bgr)?;
+        self.convert::<3>(self.width as usize, self.height as usize, &mut bgr)?;
         Ok(bgr)
     }
 
-    /// Converts the frame to the packed, top-down BGRA the live preview wants, replacing the
-    /// contents of `bgra`.
-    fn to_bgra(&self, bgra: &mut Vec<u8>) -> Result<(), CaptureError> {
-        self.convert::<4>(bgra)
+    /// Converts the frame to the packed, top-down BGRA the live preview wants, at the size it is
+    /// wanted at, replacing the contents of `bgra`.
+    ///
+    /// The size comes from the preview sink, so what is built here is the picture as it will be
+    /// shown, not a full-resolution frame that the core would then have to scale.
+    fn to_bgra(
+        &self,
+        out_width: u32,
+        out_height: u32,
+        bgra: &mut Vec<u8>,
+    ) -> Result<(), CaptureError> {
+        self.convert::<4>(out_width as usize, out_height as usize, bgra)
     }
 
-    /// Converts the frame into a packed, top-down buffer of `CHANNELS` bytes per pixel,
-    /// replacing its contents; the fourth channel, when asked for, is opaque.
-    fn convert<const CHANNELS: usize>(&self, out: &mut Vec<u8>) -> Result<(), CaptureError> {
+    /// Converts the frame into a packed, top-down buffer of `CHANNELS` bytes per pixel at
+    /// `out_width`x`out_height`, replacing its contents; the fourth channel, when asked for, is
+    /// opaque.
+    ///
+    /// A frame converted at its own size keeps every pixel it captured — that mapping is the
+    /// identity — while a preview reads only the pixels it will show.
+    fn convert<const CHANNELS: usize>(
+        &self,
+        out_width: usize,
+        out_height: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<(), CaptureError> {
         let width = self.width as usize;
         let height = self.height as usize;
         let stride = self.stride.unsigned_abs() as usize;
         if width == 0 || height == 0 || stride == 0 {
             return Err(CaptureError::Os("the captured frame has no pixels".to_owned()));
+        }
+        if out_width == 0 || out_height == 0 {
+            return Err(CaptureError::Os("no size to convert the frame to".to_owned()));
         }
         // A stride narrower than a row would run the loops below off the end of the copy. A
         // YUY2 row holds whole pixel pairs, and the even column of the last pair reads one
@@ -1060,19 +1091,24 @@ impl StillFrame {
         }
 
         out.clear();
-        out.resize(width * height * CHANNELS, 0);
+        out.resize(out_width * out_height * CHANNELS, 0);
         let bottom_up = self.stride < 0;
-        for row in 0..height {
-            let source_row = if bottom_up { height - 1 - row } else { row };
-            let target = &mut out[row * width * CHANNELS..(row + 1) * width * CHANNELS];
+        for row in 0..out_height {
+            let source_row = source_index(row, out_height, height);
+            let source_row = if bottom_up { height - 1 - source_row } else { source_row };
+            let target = &mut out[row * out_width * CHANNELS..(row + 1) * out_width * CHANNELS];
             match self.format {
                 PixelFormat::Nv12 => {
                     let luma = &self.data[source_row * stride..];
                     // One chroma row serves two luma rows.
                     let chroma = &self.data[stride * height + (source_row / 2) * stride..];
-                    for column in 0..width {
-                        let (u, v) = (chroma[column / 2 * 2] as i32, chroma[column / 2 * 2 + 1] as i32);
-                        let pixel = yuv_to_bgr(luma[column] as i32, u, v);
+                    for column in 0..out_width {
+                        let source_column = source_index(column, out_width, width);
+                        let (u, v) = (
+                            chroma[source_column / 2 * 2] as i32,
+                            chroma[source_column / 2 * 2 + 1] as i32,
+                        );
+                        let pixel = yuv_to_bgr(luma[source_column] as i32, u, v);
                         let target = &mut target[column * CHANNELS..];
                         target[..3].copy_from_slice(&pixel);
                         if CHANNELS == 4 {
@@ -1082,10 +1118,19 @@ impl StillFrame {
                 }
                 PixelFormat::Yuy2 => {
                     let line = &self.data[source_row * stride..];
-                    for column in 0..width {
-                        let (y, u, v) = match column % 2 {
-                            0 => (line[column * 2] as i32, line[column * 2 + 1] as i32, line[column * 2 + 3] as i32),
-                            _ => (line[column * 2] as i32, line[column * 2 - 1] as i32, line[column * 2 + 1] as i32),
+                    for column in 0..out_width {
+                        let source_column = source_index(column, out_width, width);
+                        let (y, u, v) = match source_column % 2 {
+                            0 => (
+                                line[source_column * 2] as i32,
+                                line[source_column * 2 + 1] as i32,
+                                line[source_column * 2 + 3] as i32,
+                            ),
+                            _ => (
+                                line[source_column * 2] as i32,
+                                line[source_column * 2 - 1] as i32,
+                                line[source_column * 2 + 1] as i32,
+                            ),
                         };
                         let pixel = yuv_to_bgr(y, u, v);
                         let target = &mut target[column * CHANNELS..];
@@ -1099,6 +1144,11 @@ impl StillFrame {
         }
         Ok(())
     }
+}
+
+/// The source index one output pixel reads, nearest the centre of the pixel it covers.
+fn source_index(out_index: usize, out_len: usize, source_len: usize) -> usize {
+    ((2 * out_index + 1) * source_len / (2 * out_len)).min(source_len - 1)
 }
 
 /// Encodes one frame as JPEG through the Windows Imaging Component.

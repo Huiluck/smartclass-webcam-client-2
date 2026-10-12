@@ -13,8 +13,8 @@
 //! - `media`: pull frames from the [`FrameSource`], queue them with a drop policy.
 //! - `params`: remember the capture parameters a switch applied, in memory and on disk.
 //! - `command`: the requests an embedding application sends while the client runs.
-//! - `preview`: the live picture an embedding application paints, converted and scaled out of
-//!   the frames the capture layer captures.
+//! - `preview`: the live picture an embedding application paints, produced at the size it is
+//!   shown at and paced by the consumer that paints it.
 //! - [`run`]: the supervisor that ties all of the above into a reconnect loop.
 //!
 //! # Quick start

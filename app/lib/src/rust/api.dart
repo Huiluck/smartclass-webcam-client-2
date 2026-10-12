@@ -8,7 +8,7 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'api.freezed.dart';
 
-// These functions are ignored because they are not marked as `pub`: `capabilities`, `config_dir`, `emit_preview`, `emit`, `forward_core_events`, `forward_preview_frames`, `init_logging`, `into_core`, `log_file_path`, `open_camera`, `parse_codec`, `read_server_config`, `report_stats`, `retry_after`, `runtime`, `send_command`, `server_config_path`, `state_path`, `write_server_config`
+// These functions are ignored because they are not marked as `pub`: `capabilities`, `config_dir`, `emit_preview`, `emit`, `forward_core_events`, `forward_preview_frames`, `init_logging`, `into_core`, `into_preview_frame`, `log_file_path`, `open_camera`, `parse_codec`, `read_server_config`, `report_stats`, `retry_after`, `runtime`, `send_command`, `server_config_path`, `state_path`, `write_server_config`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AgentSlot`, `CountingSource`, `MessageVisitor`, `WarnLayer`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `next_frame`, `on_event`, `preferred_codec`, `record_debug`, `record_str`, `set_parameters`, `take_photo`
 
@@ -87,11 +87,20 @@ Stream<AgentEvent> agentEvents() => RustLib.instance.api.crateApiAgentEvents();
 
 /// Subscribes to live preview frames; the returned Dart stream is the camera picture.
 ///
-/// Frames arrive only while an agent runs and a target size is set. Only frames captured after the
-/// call are delivered, one is dropped rather than queued while Dart is still decoding the previous
-/// one, and a subscription that Dart cancelled is dropped at the next frame.
+/// Frames arrive only while an agent runs and a target size is set. The picture is consumer-paced:
+/// a frame is handed over only after the UI reported the previous one through
+/// [`preview_frame_consumed`], so a subscription that decodes slower than the camera captures drops
+/// frames rather than falling further behind on each of them. Only frames captured after the call
+/// are delivered, and a subscription that Dart cancelled is dropped at the next frame.
 Stream<PreviewFrame> previewStream() =>
     RustLib.instance.api.crateApiPreviewStream();
+
+/// Reports that the UI is done with the frame it was last handed, so the next one may go out.
+///
+/// This is what paces the picture — see [`preview_stream`] — so the UI calls it once per frame it
+/// took in. A report that arrives before the next frame exists waits for it instead of being lost.
+void previewFrameConsumed() =>
+    RustLib.instance.api.crateApiPreviewFrameConsumed();
 
 /// Sets the size the preview frames are scaled to before they reach Dart.
 ///

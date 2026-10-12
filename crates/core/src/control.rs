@@ -369,6 +369,10 @@ impl<F: FrameSource + 'static> ControlState<F> {
             camera_enum: payload.camera_enum,
             stream_id: payload.stream_id.clone(),
         };
+        // The camera starts encoding before the task that reads frames exists: a stream that
+        // begins on an idle source would otherwise wait for a frame that never comes, and this
+        // is also what makes the first frame of the recording a keyframe.
+        self.source.lock().await.set_encoding(true);
         let task = media::spawn(
             self.source.clone(),
             spec,
@@ -609,6 +613,11 @@ impl<F: FrameSource + 'static> ControlState<F> {
             }
         }
 
+        // Nothing consumes frames any more, so the camera stops encoding ahead of the consumer:
+        // capture keeps running for the preview, without paying the hardware encoder for frames
+        // nobody reads.
+        self.source.lock().await.set_encoding(false);
+
         self.apply_pending().await;
     }
 }
@@ -775,6 +784,7 @@ mod tests {
     struct Harness {
         control: ControlState<RecordingSource>,
         applied: Arc<StdMutex<Vec<Applied>>>,
+        encoding: Arc<StdMutex<Vec<bool>>>,
         acks: mpsc::UnboundedReceiver<Message>,
         _media: mpsc::Receiver<MediaFrame>,
         _events: mpsc::UnboundedReceiver<CoreEvent>,
@@ -782,7 +792,7 @@ mod tests {
 
     impl Harness {
         fn new(state_path: Option<PathBuf>) -> Self {
-            let (source, applied) = RecordingSource::new(Codec::H264);
+            let (source, applied, encoding) = RecordingSource::new(Codec::H264);
             let (control_tx, acks) = mpsc::unbounded_channel();
             let (media_tx, media) = mpsc::channel(MEDIA_QUEUE_CAPACITY);
             let (events_tx, events) = mpsc::unbounded_channel();
@@ -801,6 +811,7 @@ mod tests {
             Self {
                 control,
                 applied,
+                encoding,
                 acks,
                 _media: media,
                 _events: events,
@@ -810,6 +821,14 @@ mod tests {
         /// The reconfigurations that reached the source, in order.
         fn applied(&self) -> Vec<Applied> {
             self.applied
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        }
+
+        /// The encoding changes that reached the source, in order.
+        fn encoding(&self) -> Vec<bool> {
+            self.encoding
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .clone()
@@ -826,6 +845,29 @@ mod tests {
 
             acks
         }
+    }
+
+    #[tokio::test]
+    async fn a_stream_turns_the_encoder_on_and_its_end_turns_it_off() {
+        // The camera encodes ahead of its consumer on macOS, and does that work with the
+        // hardware encoder: while no stream is active the core has to say so, or a camera that
+        // is only being previewed pays for — and, once the encoder's output backs up, blocks
+        // on — frames nobody reads.
+        let mut harness = Harness::new(None);
+
+        harness.control.handle(start_recording("stream-1")).await;
+        assert_eq!(
+            harness.encoding(),
+            vec![true],
+            "starting a stream starts the encoder"
+        );
+
+        harness.control.handle(stop_recording("stream-1")).await;
+        assert_eq!(
+            harness.encoding(),
+            vec![true, false],
+            "ending the stream stops it again"
+        );
     }
 
     #[tokio::test]

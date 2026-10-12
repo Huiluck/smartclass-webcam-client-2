@@ -58,10 +58,12 @@
 //!
 //! [`preview_stream`] carries the camera picture while an agent runs: the capture path converts
 //! every frame to RGBA and scales it aspect-locked to the size the UI last set through
-//! [`set_preview_target_size`], and this module hands those frames to every live Dart stream — a
-//! frame Dart has not consumed yet is dropped rather than queued, so the picture follows the
-//! capture rate instead of lagging behind it. The sink is registered with the run and dropped
-//! again when it ends, so a stopped agent does no conversion work at all.
+//! [`set_preview_target_size`], and this module hands those frames to every live Dart stream. The
+//! picture is consumer-paced: only the newest frame is kept, and it is handed over once the UI
+//! reports through [`preview_frame_consumed`] that it is done with the previous one, so a UI that
+//! cannot keep up with the camera drops frames instead of accumulating delay. The sink is
+//! registered with the run and dropped again when it ends, so a stopped agent does no conversion
+//! work at all.
 
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -80,6 +82,7 @@ use scwc_core::{
 use scwc_protocol::{CameraRegistration, Codec};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
+use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -335,6 +338,8 @@ pub async fn start_agent(config: AgentConfig) -> Result<(), String> {
     let (preview_tx, preview_rx) = tokio::sync::mpsc::unbounded_channel();
     scwc_core::preview::set_preview_sink(Some(preview_tx));
     runtime.spawn(forward_preview_frames(preview_rx));
+    // The first frame of a run needs no consumption report: nothing of this run is in flight yet.
+    PREVIEW_READY.notify_one();
 
     let frames = Arc::new(AtomicU64::new(0));
     let agent = runtime.spawn(async move {
@@ -545,14 +550,33 @@ pub fn agent_events(sink: StreamSink<AgentEvent>) {
 
 /// Subscribes to live preview frames; the returned Dart stream is the camera picture.
 ///
-/// Frames arrive only while an agent runs and a target size is set. Only frames captured after the
-/// call are delivered, one is dropped rather than queued while Dart is still decoding the previous
-/// one, and a subscription that Dart cancelled is dropped at the next frame.
+/// Frames arrive only while an agent runs and a target size is set. The picture is consumer-paced:
+/// a frame is handed over only after the UI reported the previous one through
+/// [`preview_frame_consumed`], so a subscription that decodes slower than the camera captures drops
+/// frames rather than falling further behind on each of them. Only frames captured after the call
+/// are delivered, and a subscription that Dart cancelled is dropped at the next frame.
 pub fn preview_stream(sink: StreamSink<PreviewFrame>) {
     PREVIEW_SUBSCRIBERS
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .push(sink);
+    // Nothing is in flight for a stream that just subscribed, so its first frame needs no report.
+    PREVIEW_READY.notify_one();
+}
+
+/// Reports that the UI is done with the frame it was last handed, so the next one may go out.
+///
+/// This is what paces the picture — see [`preview_stream`] — so the UI calls it once per frame it
+/// took in. A report that arrives before the next frame exists waits for it instead of being lost.
+///
+/// It is also what releases the capture path's permit
+/// ([`scwc_core::preview::preview_frame_consumed`]): until the ack arrives, the capture path
+/// produces no frame at all — the Apple shim does not even render one — so a UI slower than the
+/// camera costs the capture path nothing rather than costing it a converted frame per capture.
+#[frb(sync)]
+pub fn preview_frame_consumed() {
+    scwc_core::preview::preview_frame_consumed();
+    PREVIEW_READY.notify_one();
 }
 
 /// Sets the size the preview frames are scaled to before they reach Dart.
@@ -566,22 +590,47 @@ pub fn set_preview_target_size(width: u32, height: u32) {
     scwc_core::preview::set_preview_target_size(width, height);
 }
 
-/// Hands preview frames to every live Dart stream, until the capture path drops its sender.
+/// Turns a frame of the capture path into the frame Dart receives; the pixels move, nothing copies.
+fn into_preview_frame(frame: CorePreviewFrame) -> PreviewFrame {
+    let CorePreviewFrame {
+        rgba,
+        width,
+        height,
+    } = frame;
+    PreviewFrame {
+        rgba,
+        width,
+        height,
+    }
+}
+
+/// Hands preview frames to every live Dart stream, one at a time and only when the UI is ready for
+/// the next.
 ///
-/// That sender is dropped when the run ends, which is what ends this task.
+/// This is what keeps the picture consumer-paced: every frame the capture path produces is taken
+/// off its channel at once, so nothing waits there, but only the newest is kept and only it is
+/// handed over on the next [`preview_frame_consumed`]. A UI slower than the camera therefore drops
+/// frames instead of building a backlog, and the frame rate follows the capture parameters as soon
+/// as it keeps up again.
+///
+/// The task ends when the capture path drops its sender, which is what ending a run does.
 async fn forward_preview_frames(mut frames: UnboundedReceiver<CorePreviewFrame>) {
-    while let Some(frame) = frames.recv().await {
-        let CorePreviewFrame {
-            rgba,
-            width,
-            height,
-        } = frame;
-        // The pixels move into the frame Dart receives; nothing here copies them.
-        emit_preview(PreviewFrame {
-            rgba,
-            width,
-            height,
-        });
+    let mut latest: Option<PreviewFrame> = None;
+    loop {
+        tokio::select! {
+            // Taking everything that arrives is what keeps the capture path's channel empty; all
+            // but the newest frame are dropped right here.
+            incoming = frames.recv() => match incoming {
+                Some(frame) => latest = Some(into_preview_frame(frame)),
+                None => break,
+            },
+            // What goes out is the newest frame the UI has not seen yet.
+            () = PREVIEW_READY.notified(), if latest.is_some() => {
+                if let Some(frame) = latest.take() {
+                    emit_preview(frame);
+                }
+            }
+        }
     }
 }
 
@@ -654,6 +703,12 @@ static SUBSCRIBERS: Mutex<Vec<StreamSink<AgentEvent>>> = Mutex::new(Vec::new());
 /// Dart streams subscribed to [`preview_stream`].
 static PREVIEW_SUBSCRIBERS: Mutex<Vec<StreamSink<PreviewFrame>>> = Mutex::new(Vec::new());
 
+/// Whether the UI is ready for the next preview frame; see [`preview_frame_consumed`].
+///
+/// A permit is stored while nothing waits for one, so a consumption report that arrives before the
+/// next frame exists waits for it rather than being lost.
+static PREVIEW_READY: Notify = Notify::const_new();
+
 /// Guards the one-time installation of the `tracing` subscriber.
 static LOGGING: Once = Once::new();
 
@@ -695,7 +750,13 @@ async fn forward_core_events(mut events: UnboundedReceiver<CoreEvent>) {
                 bitrate_kbps,
             }),
             CoreEvent::Notice { message } => emit(AgentEvent::Notice { message }),
-            CoreEvent::Attached => RECONNECT_ATTEMPTS.store(0, Ordering::Relaxed),
+            CoreEvent::Attached => {
+                RECONNECT_ATTEMPTS.store(0, Ordering::Relaxed);
+                // Attached is the proof the device is live on the server; the first-frame
+                // signal in CountingSource only ever fires while a recording pulls frames,
+                // which would leave a healthy standby reading as "Connecting" forever.
+                emit(AgentEvent::Online);
+            }
             CoreEvent::SessionStarted | CoreEvent::SessionEnded { .. } => {}
         }
     }
@@ -903,6 +964,10 @@ impl<S: FrameSource> FrameSource for CountingSource<S> {
 
     async fn take_photo(&mut self) -> Result<Vec<u8>, scwc_core::SourceError> {
         self.inner.take_photo().await
+    }
+
+    fn set_encoding(&mut self, enabled: bool) {
+        self.inner.set_encoding(enabled);
     }
 
     fn preferred_codec(&self) -> Codec {

@@ -260,10 +260,16 @@ class AgentState extends ChangeNotifier {
   /// restarts or stops, so a picture can be told apart from one of an earlier pipeline.
   int get previewEpoch => _previewEpoch;
 
-  /// Frame rate the pipeline runs at, or is being asked to run at; null while nothing is picked.
+  /// Width over height of the picture the camera produces, or null while no size is known.
   ///
-  /// This is what the preview derives its staleness timeout from.
-  int? get captureFps => _liveParams?.fps ?? _fps;
+  /// The stream path's frames carry their own size, so only the native texture needs to be told the
+  /// shape to letterbox its picture in; this is the resolution the capture path asks the camera
+  /// for.
+  double? get previewAspectRatio {
+    final size = _parseResolution(_resolution);
+    if (size == null || size.$2 == 0) return null;
+    return size.$1 / size.$2;
+  }
 
   /// True while the staged selection differs from what the running agent uses.
   bool get stagedDiffers {

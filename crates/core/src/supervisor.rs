@@ -313,6 +313,11 @@ where
             config.events.emit(CoreEvent::SessionEnded {
                 reason: format!("{outcome:?}"),
             });
+            // A session that ends takes its recording with it, and the camera must not keep
+            // encoding frames for a stream that is gone: `stop_recording` has already disabled
+            // it, and this covers the ways a session ends without one — a failure, an abort, a
+            // replaced connection.
+            source.lock().await.set_encoding(false);
             outcome
         }
         Err(error) => {
@@ -469,6 +474,10 @@ mod tests {
             self.source.take_photo().await
         }
 
+        fn set_encoding(&mut self, enabled: bool) {
+            self.source.set_encoding(enabled);
+        }
+
         fn preferred_codec(&self) -> Codec {
             self.source.preferred_codec()
         }
@@ -488,7 +497,7 @@ mod tests {
             }
         });
 
-        let (source, _applied) = RecordingSource::new(Codec::H264);
+        let (source, _applied, _encoding) = RecordingSource::new(Codec::H264);
         let closes = Arc::new(AtomicUsize::new(0));
         let source = Closing {
             source,

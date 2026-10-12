@@ -62,11 +62,16 @@
 //! # Live preview
 //!
 //! Every backend also offers the frames it captures to
-//! [`scwc_core::preview`](scwc_core::preview), which converts them to RGBA, scales them to the
-//! size the interface asked for and hands them to whoever registered a sink there. The
-//! conversion is skipped entirely while no preview is wanted, so a client whose interface shows
-//! no picture pays nothing for the path: the Apple shim asks a gate before it renders a frame,
-//! and the Linux and Windows backends ask before they convert one.
+//! [`scwc_core::preview`](scwc_core::preview), which swaps them to RGBA and hands them to
+//! whoever registered a sink there. The path is paced by the consumer and costs the capture
+//! nothing it cannot keep up with: each backend asks [`scwc_core::preview::next_frame_size`]
+//! what the next frame is worth before it converts anything, and that answers `None` while no
+//! preview is configured, while the frame the consumer was handed has not been reported
+//! consumed, and for a frame without pixels. When it answers, it names the size to produce the
+//! frame at — the interface's own size fitted to the frame's aspect ratio — so a preview is
+//! built at the size it is shown at and never at the capture resolution. The Apple backend hands
+//! the frame to a queue of its own before rendering it, so its capture callback only asks the
+//! gate and returns.
 //!
 //! # Example
 //!
@@ -127,6 +132,8 @@ use unsupported as sys;
 
 pub use crate::error::CaptureError;
 pub use crate::source::{CaptureSource, open};
+#[cfg(target_os = "macos")]
+pub use crate::source::{release_frame_buffer, retain_frame_buffer};
 
 /// Lists the cameras of the host.
 ///

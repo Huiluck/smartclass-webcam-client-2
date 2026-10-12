@@ -233,6 +233,15 @@ impl Handle {
         }
     }
 
+    /// Whether a consumer is reading frames.
+    ///
+    /// Accepted and ignored: this backend's pump encodes every frame it captures, so a camera
+    /// with no stream keeps paying for the encoder here too. The flag exists so the core can
+    /// drive every platform the same way; gating this pump is a change to its own loop, with a
+    /// forced IDR on the way back on, which is not something that can be checked on a machine
+    /// that cannot run it.
+    pub(crate) fn set_encoding(&self, _enabled: bool) {}
+
     /// Rebuilds the pipeline with new capture and encoder parameters.
     ///
     /// Blocks until the capture thread has handled the request, which is at most one frame.
@@ -569,14 +578,30 @@ impl Capture {
 
     /// Offers the frame the encoder is about to be given to the live preview.
     ///
-    /// Nothing is converted while no preview is wanted: the conversion is a whole-frame pass,
-    /// and the preview sink is what decides whether it is worth it.
+    /// Nothing is converted while no preview is wanted, and what is converted is the size the sink
+    /// asked for rather than the capture resolution: the conversion is a whole-frame pass, so a
+    /// preview must neither cost a pass nobody wants nor scale the whole frame afterwards.
     fn publish_preview(&mut self, width: usize, height: usize) {
-        if !scwc_core::preview::preview_enabled() {
+        let Some((out_width, out_height)) =
+            scwc_core::preview::next_frame_size(width as u32, height as u32)
+        else {
             return;
-        }
-        match convert::bgra_from_nv12(&self.frame, width, width, height, &mut self.bgra) {
-            Ok(()) => scwc_core::preview::publish_bgra(&self.bgra, width as u32, height as u32),
+        };
+        let (out_width, out_height) = (out_width as usize, out_height as usize);
+        match convert::bgra_from_nv12(
+            &self.frame,
+            width,
+            width,
+            height,
+            out_width,
+            out_height,
+            &mut self.bgra,
+        ) {
+            Ok(()) => scwc_core::preview::publish_bgra(
+                &self.bgra,
+                out_width as u32,
+                out_height as u32,
+            ),
             Err(error) => tracing::warn!(%error, "could not build the preview frame"),
         }
     }

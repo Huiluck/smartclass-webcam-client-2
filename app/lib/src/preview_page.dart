@@ -56,6 +56,7 @@ class PreviewView extends StatefulWidget {
 class _PreviewViewState extends State<PreviewView> {
   int? _width;
   int? _height;
+  bool _textured = false;
 
   @override
   void dispose() {
@@ -64,14 +65,21 @@ class _PreviewViewState extends State<PreviewView> {
     super.dispose();
   }
 
-  /// Asks the client to scale frames to `width` x `height` pixels, once per size.
+  /// Asks the client to scale frames to `width` x `height` pixels, once per size and source.
   ///
-  /// A plain bridge call, not framework state: it only changes what the Rust side sends next.
-  void _setTargetSize(int width, int height) {
-    if (width == _width && height == _height) return;
+  /// A plain bridge call, not framework state: it only changes what the Rust side sends next. While
+  /// the platform paints the camera's own buffer there is no frame path to size, so the capture
+  /// path is told `0x0` — and the layout size goes back with the stream as soon as the picture comes
+  /// from it again.
+  void _setTargetSize(int width, int height, {required bool textured}) {
+    if (width == _width && height == _height && textured == _textured) return;
     _width = width;
     _height = height;
-    setPreviewTargetSize(width: width, height: height);
+    _textured = textured;
+    setPreviewTargetSize(
+      width: textured ? 0 : width,
+      height: textured ? 0 : height,
+    );
   }
 
   @override
@@ -79,17 +87,37 @@ class _PreviewViewState extends State<PreviewView> {
     final ratio = MediaQuery.devicePixelRatioOf(context);
     return LayoutBuilder(
       builder: (context, constraints) {
-        // The frames are scaled for the pixels this area is painted with; the UI only centres what
-        // it gets.
-        _setTargetSize(
-          (constraints.maxWidth * ratio).round(),
-          (constraints.maxHeight * ratio).round(),
-        );
         return ColoredBox(
           color: Colors.black,
           child: ListenableBuilder(
             listenable: widget.preview,
             builder: (context, _) {
+              final textureId = widget.preview.textureId;
+              // The frames are scaled for the pixels this area is painted with; the UI only centres
+              // what it gets. Said here, where a change of source is seen as well as a change of
+              // size.
+              _setTargetSize(
+                (constraints.maxWidth * ratio).round(),
+                (constraints.maxHeight * ratio).round(),
+                textured: textureId != null,
+              );
+              if (textureId != null) {
+                // The platform paints the camera's own buffer, so the widget only has to give it a
+                // box of the camera's shape: `AspectRatio` inside `Center` is what `contain` is for
+                // the stream path's frames.
+                final ratio = widget.preview.textureAspectRatio;
+                if (ratio == null) {
+                  return SizedBox.expand(child: Texture(textureId: textureId));
+                }
+                return SizedBox.expand(
+                  child: Center(
+                    child: AspectRatio(
+                      aspectRatio: ratio,
+                      child: Texture(textureId: textureId),
+                    ),
+                  ),
+                );
+              }
               final image = widget.preview.image;
               if (image == null) {
                 return Center(
