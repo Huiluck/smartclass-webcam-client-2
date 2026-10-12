@@ -40,6 +40,9 @@ A new Flutter FFI plugin project.
     'DEFINES_MODULE' => 'YES',
     # Flutter.framework does not contain a i386 slice.
     'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386',
-    'OTHER_LDFLAGS' => '-force_load ${BUILT_PRODUCTS_DIR}/librust_lib.a',
+    # librust_lib.a drives AVFoundation capture and VideoToolbox encoding; the
+    # symbols must be resolvable wherever the static library is linked
+    # (Pods-Runner.framework under use_frameworks!).
+    'OTHER_LDFLAGS' => '-force_load ${BUILT_PRODUCTS_DIR}/librust_lib.a -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework VideoToolbox',
   }
 end
