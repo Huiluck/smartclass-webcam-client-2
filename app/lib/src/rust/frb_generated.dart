@@ -67,7 +67,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.13.0';
 
   @override
-  int get rustContentHash => 978262240;
+  int get rustContentHash => 1835025935;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -81,11 +81,26 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
 abstract class RustLibApi extends BaseApi {
   Stream<AgentEvent> crateApiAgentEvents();
 
+  void crateApiApplyCaptureParams({
+    required String resolution,
+    required int fps,
+    required String codec,
+    int? bitrateKbps,
+  });
+
   String crateApiSimpleGreet({required String name});
 
   Future<void> crateApiSimpleInitApp();
 
   List<CameraInfoDto> crateApiListCameras();
+
+  ServerConfig? crateApiLoadServerConfig();
+
+  void crateApiSaveServerConfig({
+    required String server,
+    required String deviceId,
+    required String token,
+  });
 
   Future<void> crateApiStartAgent({required AgentConfig config});
 
@@ -133,13 +148,46 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "agent_events", argNames: ["sink"]);
 
   @override
+  void crateApiApplyCaptureParams({
+    required String resolution,
+    required int fps,
+    required String codec,
+    int? bitrateKbps,
+  }) {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(resolution, serializer);
+          sse_encode_u_32(fps, serializer);
+          sse_encode_String(codec, serializer);
+          sse_encode_opt_box_autoadd_u_32(bitrateKbps, serializer);
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 2)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiApplyCaptureParamsConstMeta,
+        argValues: [resolution, fps, codec, bitrateKbps],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiApplyCaptureParamsConstMeta => const TaskConstMeta(
+    debugName: "apply_capture_params",
+    argNames: ["resolution", "fps", "codec", "bitrateKbps"],
+  );
+
+  @override
   String crateApiSimpleGreet({required String name}) {
     return handler.executeSync(
       SyncTask(
         callFfi: () {
           final serializer = SseSerializer(generalizedFrbRustBinding);
           sse_encode_String(name, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 2)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 3)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_String,
@@ -164,7 +212,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 3,
+            funcId: 4,
             port: port_,
           );
         },
@@ -188,7 +236,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       SyncTask(
         callFfi: () {
           final serializer = SseSerializer(generalizedFrbRustBinding);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 4)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 5)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_list_camera_info_dto,
@@ -205,6 +253,59 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "list_cameras", argNames: []);
 
   @override
+  ServerConfig? crateApiLoadServerConfig() {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 6)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_opt_box_autoadd_server_config,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiLoadServerConfigConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiLoadServerConfigConstMeta =>
+      const TaskConstMeta(debugName: "load_server_config", argNames: []);
+
+  @override
+  void crateApiSaveServerConfig({
+    required String server,
+    required String deviceId,
+    required String token,
+  }) {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(server, serializer);
+          sse_encode_String(deviceId, serializer);
+          sse_encode_String(token, serializer);
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 7)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSaveServerConfigConstMeta,
+        argValues: [server, deviceId, token],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSaveServerConfigConstMeta => const TaskConstMeta(
+    debugName: "save_server_config",
+    argNames: ["server", "deviceId", "token"],
+  );
+
+  @override
   Future<void> crateApiStartAgent({required AgentConfig config}) {
     return handler.executeNormal(
       NormalTask(
@@ -214,7 +315,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 5,
+            funcId: 8,
             port: port_,
           );
         },
@@ -241,7 +342,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 6,
+            funcId: 9,
             port: port_,
           );
         },
@@ -294,7 +395,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       height: dco_decode_u_32(arr[5]),
       fps: dco_decode_u_32(arr[6]),
       codec: dco_decode_String(arr[7]),
-      bitrateKbps: dco_decode_u_32(arr[8]),
+      bitrateKbps: dco_decode_opt_box_autoadd_u_32(arr[8]),
     );
   }
 
@@ -313,11 +414,22 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       case 4:
         return AgentEvent_Reconnecting(attempt: dco_decode_u_32(raw[1]));
       case 5:
+        return AgentEvent_Warn(message: dco_decode_String(raw[1]));
+      case 6:
+        return AgentEvent_ParametersApplied(
+          resolution: dco_decode_String(raw[1]),
+          fps: dco_decode_u_32(raw[2]),
+          codec: dco_decode_String(raw[3]),
+          bitrateKbps: dco_decode_u_32(raw[4]),
+        );
+      case 7:
+        return AgentEvent_Notice(message: dco_decode_String(raw[1]));
+      case 8:
         return AgentEvent_Stats(
           sentFrames: dco_decode_u_64(raw[1]),
           droppedFrames: dco_decode_u_64(raw[2]),
         );
-      case 6:
+      case 9:
         return AgentEvent_Error(message: dco_decode_String(raw[1]));
       default:
         throw Exception("unreachable");
@@ -328,6 +440,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   AgentConfig dco_decode_box_autoadd_agent_config(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return dco_decode_agent_config(raw);
+  }
+
+  @protected
+  ServerConfig dco_decode_box_autoadd_server_config(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_server_config(raw);
+  }
+
+  @protected
+  int dco_decode_box_autoadd_u_32(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as int;
   }
 
   @protected
@@ -371,6 +495,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  ServerConfig? dco_decode_opt_box_autoadd_server_config(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_server_config(raw);
+  }
+
+  @protected
+  int? dco_decode_opt_box_autoadd_u_32(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_u_32(raw);
+  }
+
+  @protected
   (String, Uint32List) dco_decode_record_string_list_prim_u_32_strict(
     dynamic raw,
   ) {
@@ -382,6 +518,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     return (
       dco_decode_String(arr[0]),
       dco_decode_list_prim_u_32_strict(arr[1]),
+    );
+  }
+
+  @protected
+  ServerConfig dco_decode_server_config(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 3)
+      throw Exception('unexpected arr length: expect 3 but see ${arr.length}');
+    return ServerConfig(
+      server: dco_decode_String(arr[0]),
+      deviceId: dco_decode_String(arr[1]),
+      token: dco_decode_String(arr[2]),
     );
   }
 
@@ -442,7 +591,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_height = sse_decode_u_32(deserializer);
     var var_fps = sse_decode_u_32(deserializer);
     var var_codec = sse_decode_String(deserializer);
-    var var_bitrateKbps = sse_decode_u_32(deserializer);
+    var var_bitrateKbps = sse_decode_opt_box_autoadd_u_32(deserializer);
     return AgentConfig(
       server: var_server,
       deviceId: var_deviceId,
@@ -475,13 +624,30 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         var var_attempt = sse_decode_u_32(deserializer);
         return AgentEvent_Reconnecting(attempt: var_attempt);
       case 5:
+        var var_message = sse_decode_String(deserializer);
+        return AgentEvent_Warn(message: var_message);
+      case 6:
+        var var_resolution = sse_decode_String(deserializer);
+        var var_fps = sse_decode_u_32(deserializer);
+        var var_codec = sse_decode_String(deserializer);
+        var var_bitrateKbps = sse_decode_u_32(deserializer);
+        return AgentEvent_ParametersApplied(
+          resolution: var_resolution,
+          fps: var_fps,
+          codec: var_codec,
+          bitrateKbps: var_bitrateKbps,
+        );
+      case 7:
+        var var_message = sse_decode_String(deserializer);
+        return AgentEvent_Notice(message: var_message);
+      case 8:
         var var_sentFrames = sse_decode_u_64(deserializer);
         var var_droppedFrames = sse_decode_u_64(deserializer);
         return AgentEvent_Stats(
           sentFrames: var_sentFrames,
           droppedFrames: var_droppedFrames,
         );
-      case 6:
+      case 9:
         var var_message = sse_decode_String(deserializer);
         return AgentEvent_Error(message: var_message);
       default:
@@ -495,6 +661,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return (sse_decode_agent_config(deserializer));
+  }
+
+  @protected
+  ServerConfig sse_decode_box_autoadd_server_config(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_server_config(deserializer));
+  }
+
+  @protected
+  int sse_decode_box_autoadd_u_32(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_u_32(deserializer));
   }
 
   @protected
@@ -552,6 +732,30 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  ServerConfig? sse_decode_opt_box_autoadd_server_config(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_server_config(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
+  int? sse_decode_opt_box_autoadd_u_32(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_u_32(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
   (String, Uint32List) sse_decode_record_string_list_prim_u_32_strict(
     SseDeserializer deserializer,
   ) {
@@ -559,6 +763,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_field0 = sse_decode_String(deserializer);
     var var_field1 = sse_decode_list_prim_u_32_strict(deserializer);
     return (var_field0, var_field1);
+  }
+
+  @protected
+  ServerConfig sse_decode_server_config(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_server = sse_decode_String(deserializer);
+    var var_deviceId = sse_decode_String(deserializer);
+    var var_token = sse_decode_String(deserializer);
+    return ServerConfig(
+      server: var_server,
+      deviceId: var_deviceId,
+      token: var_token,
+    );
   }
 
   @protected
@@ -639,7 +856,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_u_32(self.height, serializer);
     sse_encode_u_32(self.fps, serializer);
     sse_encode_String(self.codec, serializer);
-    sse_encode_u_32(self.bitrateKbps, serializer);
+    sse_encode_opt_box_autoadd_u_32(self.bitrateKbps, serializer);
   }
 
   @protected
@@ -658,15 +875,32 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       case AgentEvent_Reconnecting(attempt: final attempt):
         sse_encode_i_32(4, serializer);
         sse_encode_u_32(attempt, serializer);
+      case AgentEvent_Warn(message: final message):
+        sse_encode_i_32(5, serializer);
+        sse_encode_String(message, serializer);
+      case AgentEvent_ParametersApplied(
+        resolution: final resolution,
+        fps: final fps,
+        codec: final codec,
+        bitrateKbps: final bitrateKbps,
+      ):
+        sse_encode_i_32(6, serializer);
+        sse_encode_String(resolution, serializer);
+        sse_encode_u_32(fps, serializer);
+        sse_encode_String(codec, serializer);
+        sse_encode_u_32(bitrateKbps, serializer);
+      case AgentEvent_Notice(message: final message):
+        sse_encode_i_32(7, serializer);
+        sse_encode_String(message, serializer);
       case AgentEvent_Stats(
         sentFrames: final sentFrames,
         droppedFrames: final droppedFrames,
       ):
-        sse_encode_i_32(5, serializer);
+        sse_encode_i_32(8, serializer);
         sse_encode_u_64(sentFrames, serializer);
         sse_encode_u_64(droppedFrames, serializer);
       case AgentEvent_Error(message: final message):
-        sse_encode_i_32(6, serializer);
+        sse_encode_i_32(9, serializer);
         sse_encode_String(message, serializer);
     }
   }
@@ -678,6 +912,21 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_agent_config(self, serializer);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_server_config(
+    ServerConfig self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_server_config(self, serializer);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_u_32(int self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_32(self, serializer);
   }
 
   @protected
@@ -739,6 +988,29 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_opt_box_autoadd_server_config(
+    ServerConfig? self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_server_config(self, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_opt_box_autoadd_u_32(int? self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_u_32(self, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_record_string_list_prim_u_32_strict(
     (String, Uint32List) self,
     SseSerializer serializer,
@@ -746,6 +1018,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.$1, serializer);
     sse_encode_list_prim_u_32_strict(self.$2, serializer);
+  }
+
+  @protected
+  void sse_encode_server_config(ServerConfig self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.server, serializer);
+    sse_encode_String(self.deviceId, serializer);
+    sse_encode_String(self.token, serializer);
   }
 
   @protected

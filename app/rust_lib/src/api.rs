@@ -6,35 +6,80 @@
 //!
 //! # Events
 //!
-//! The core exposes no hooks, so [`AgentEvent`] is derived from what is observable through its
-//! public API alone:
+//! [`AgentEvent`] has two sources:
 //!
-//! - [`AgentEvent::Connecting`] — emitted when a run starts.
-//! - [`AgentEvent::Online`] — emitted when the first encoded frame is pulled through the
-//!   counting source. The core pulls frames only for a stream the server announced, so that
-//!   first frame is the earliest point at which the registration was accepted, the attach
-//!   succeeded and a stream is live.
-//! - [`AgentEvent::Stats`] — once a second while the agent runs.
-//! - [`AgentEvent::Error`] — [`run`] returning an error, which means the client cannot go on
-//!   (a configuration that can never work); transport failures are retried inside the core.
+//! - the core's event hook, which reports its register → attach → session cycle and the failures
+//!   it survives:
+//!   - [`AgentEvent::Reconnecting`] — the core is backing off before another registration
+//!     attempt; the attempt counts up since the last attach that worked.
+//!   - [`AgentEvent::Warn`] — a failure the core reported, either through its hook or as a
+//!     `tracing` record the subscriber below forwards.
+//!   - [`AgentEvent::ParametersApplied`] — the parameter set the capture pipeline is actually
+//!     running, which is also how the set a session opens with reaches the UI.
+//!   - [`AgentEvent::Notice`] — a request the core had to postpone, a parameter switch or a
+//!     reconnect that waits for the stream that was live when it arrived.
+//! - what this module observes itself:
+//!   - [`AgentEvent::Connecting`] — emitted when a run starts, and on every registration the core
+//!     begins.
+//!   - [`AgentEvent::Online`] — emitted when the first encoded frame is pulled through the
+//!     counting source. The core pulls frames only for a stream the server announced, so that
+//!     first frame is the earliest point at which the registration was accepted, the attach
+//!     succeeded and a stream is live.
+//!   - [`AgentEvent::Stats`] — once a second while the agent runs.
+//!   - [`AgentEvent::Error`] — [`run`] returning an error, which means the client cannot go on
+//!     (a configuration that can never work); transport failures are retried inside the core.
+//!     The agent task ending without such an error — a panic inside the runtime — arrives here
+//!     too, so it cannot go unnoticed.
 //!
-//! `Recording`, `RecordingStopped` and `Reconnecting` are part of the API but are not emitted by
-//! this milestone: stream ids are assigned inside the core's session and reconnects happen
-//! inside its supervisor, and neither is observable through the core's public API. Emitting
-//! them would mean inventing ids or attempts. They stay in the enum for the milestone that adds
-//! the hooks.
+//! `Recording` and `RecordingStopped` are part of the API but are not emitted yet: stream ids are
+//! assigned inside the core's control state and never leave it.
+//!
+//! # Configuration
+//!
+//! The server identity is not part of the running agent alone: [`save_server_config`] writes it to
+//! `<config dir>/sc-webcam/server.json` — next to the capture parameters the core persists — and
+//! [`load_server_config`] reads it back, which is what lets a fresh launch connect on its own.
+//!
+//! # Driving a running agent
+//!
+//! [`apply_capture_params`] and [`save_server_config`] send the running agent the two requests the
+//! core knows how to route: a parameter switch travels the `switch_camera` path (applied at once
+//! while no stream is live, at the end of the active one otherwise), and a reconnect registers
+//! again with the saved credentials — immediately, unless a stream is live.
+//!
+//! # Logging
+//!
+//! Every crate logs through `tracing`, which is a no-op while no subscriber is installed. The
+//! first [`start_agent`] installs a process-wide one that appends to a file in the system
+//! temporary directory and forwards warnings and errors of the client crates into the event
+//! stream.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, Once};
 use std::time::Duration;
 
 use flutter_rust_bridge::frb;
-use scwc_capture::{CaptureConfig, enumerate_cameras, open};
-use scwc_core::{ClientConfig, EncodedFrame, FrameSource, run};
+use scwc_capture::{CaptureConfig, CaptureSource, enumerate_cameras, open};
+use scwc_core::{
+    ClientConfig, CoreEvent, EncodedFrame, FrameSource, ServerConfig as CoreServerConfig,
+    SwitchParams, UiCommand, default_bitrate_kbps, run,
+};
 use scwc_protocol::{CameraRegistration, Codec};
+use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
-use tokio::sync::oneshot;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
+use tracing::field::{Field, Visit};
+use tracing::{Event, Level, Subscriber};
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::{Layer, layer::Context};
 
 use crate::frb_generated::StreamSink;
 
@@ -68,8 +113,32 @@ pub struct AgentConfig {
     pub fps: u32,
     /// `h264` or `h265`, exactly as the protocol spells them.
     pub codec: String,
-    /// Encoder bitrate in kilobits per second.
-    pub bitrate_kbps: u32,
+    /// Encoder bitrate in kilobits per second; `None` derives one from the codec, the resolution
+    /// and the frame rate, which is what an empty bitrate field in the UI means.
+    pub bitrate_kbps: Option<u32>,
+}
+
+/// The server identity the client registers with, as the UI shows and stores it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerConfig {
+    /// Server base URL, for example `https://smartclass.example.edu`.
+    pub server: String,
+    /// Device id the token was issued for.
+    pub device_id: String,
+    /// Device bearer token (`wdt_...`).
+    pub token: String,
+}
+
+impl ServerConfig {
+    /// The same identity in the vocabulary the core speaks; the field name differs only because
+    /// the UI calls the credential what the operator calls it.
+    fn into_core(self) -> CoreServerConfig {
+        CoreServerConfig {
+            server: self.server,
+            device_id: self.device_id,
+            device_token: self.token,
+        }
+    }
 }
 
 /// Progress of the background agent.
@@ -86,10 +155,35 @@ pub enum AgentEvent {
     },
     /// The server's stream ended.
     RecordingStopped,
-    /// The connection died and the core is registering again.
+    /// The core lost its connection and is registering again.
     Reconnecting {
-        /// Reconnect attempt, counting from one.
+        /// Reconnect attempts since the last attach that worked, counting from one.
         attempt: u32,
+    },
+    /// A failure the client survived; it keeps capturing.
+    Warn {
+        /// Human-readable message.
+        message: String,
+    },
+    /// The capture pipeline is now running this parameter set.
+    ///
+    /// Emitted for every switch and for the set a session opens with, so the UI can show what the
+    /// camera actually runs instead of what it asked for. The agent drives one camera, so the
+    /// set is not attributed.
+    ParametersApplied {
+        /// Protocol resolution, for example `1920x1080`.
+        resolution: String,
+        /// Frame rate in frames per second.
+        fps: u32,
+        /// Codec the frames are encoded with, spelled as the protocol spells it (`h264`).
+        codec: String,
+        /// Encoder bitrate in kilobits per second.
+        bitrate_kbps: u32,
+    },
+    /// Something the client postponed or wants the operator to know that is not a failure.
+    Notice {
+        /// Human-readable message.
+        message: String,
     },
     /// Frame counters, reported once a second while the agent runs.
     Stats {
@@ -130,8 +224,11 @@ pub fn list_cameras() -> Result<Vec<CameraInfoDto>, String> {
 /// Returns as soon as the agent is scheduled. Fails when an agent already runs, or when the
 /// configuration can never work: an empty device id or token, an unparsable server URL, an
 /// unsupported codec name, or no camera at all. Everything that can fail later — the camera not
-/// opening, the server rejecting the token — arrives as [`AgentEvent::Error`].
+/// opening, the server rejecting the token — arrives as an [`AgentEvent`] the agent retries
+/// through, and the client only stops when [`stop_agent`] asks it to.
 pub async fn start_agent(config: AgentConfig) -> Result<(), String> {
+    init_logging();
+
     let codec = parse_codec(&config.codec)?;
     let resolution = format!("{}x{}", config.width, config.height);
     let (supported_resolutions, supported_framerates) =
@@ -142,7 +239,14 @@ pub async fn start_agent(config: AgentConfig) -> Result<(), String> {
         Codec::H265 => vec![Codec::H265, Codec::H264],
         _ => vec![Codec::H264, Codec::H265],
     };
-    let client_config = ClientConfig::new(
+    // An empty bitrate field means "whatever the stream needs": the protocol has no bitrate, so
+    // the client derives the one the core would apply from the same three parameters.
+    let bitrate_kbps = config
+        .bitrate_kbps
+        .unwrap_or_else(|| default_bitrate_kbps(codec, &resolution, config.fps));
+
+    let (commands_tx, commands_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut client_config = ClientConfig::new(
         config.server,
         config.device_id,
         config.token,
@@ -156,6 +260,11 @@ pub async fn start_agent(config: AgentConfig) -> Result<(), String> {
             attrs: Default::default(),
         }],
     );
+    // A parameter switch the server asked for survives a restart of the agent, so the next
+    // session starts from it instead of from the announced defaults.
+    client_config.state_path = state_path();
+    // What the UI sends while the agent runs: parameter switches and requests to register again.
+    client_config.commands = Some(commands_rx);
     client_config.validate().map_err(|error| error.to_string())?;
 
     let capture_config = CaptureConfig {
@@ -164,14 +273,14 @@ pub async fn start_agent(config: AgentConfig) -> Result<(), String> {
         height: config.height,
         fps: config.fps,
         codec,
-        bitrate_kbps: config.bitrate_kbps,
+        bitrate_kbps,
     };
 
     // Started before the slot is reserved, so a runtime that cannot start never leaves the slot
     // looking busy.
     let runtime = runtime()?;
 
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (generation, previous) = {
         let mut slot = AGENT.lock().unwrap_or_else(|error| error.into_inner());
         if slot.shutdown.is_some() {
@@ -179,6 +288,7 @@ pub async fn start_agent(config: AgentConfig) -> Result<(), String> {
         }
         slot.generation += 1;
         slot.shutdown = Some(shutdown_tx);
+        slot.commands = Some(commands_tx);
         (slot.generation, slot.task.take())
     };
 
@@ -188,27 +298,30 @@ pub async fn start_agent(config: AgentConfig) -> Result<(), String> {
         let _ = task.await;
     }
 
+    // The core reports its lifecycle here; the forwarder below turns that into the events the UI
+    // already knows. It ends on its own once the run task drops its configuration.
+    let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<CoreEvent>();
+    client_config.events = Some(events_tx);
+    RECONNECT_ATTEMPTS.store(0, Ordering::Relaxed);
+    runtime.spawn(forward_core_events(events_rx));
+
     let frames = Arc::new(AtomicU64::new(0));
-    let task = runtime.spawn(async move {
+    let agent = runtime.spawn(async move {
         emit(AgentEvent::Connecting);
         let stats = tokio::spawn(report_stats(Arc::clone(&frames)));
 
-        // `open` starts the capture session, which can block for as long as the platform takes
-        // to bring a camera up (and, on macOS, to ask for camera access).
-        let result = match open(capture_config) {
-            Ok(source) => {
-                let source = CountingSource {
-                    inner: source,
-                    frames,
-                };
+        let result = match open_camera(&capture_config, &shutdown_rx, &frames).await {
+            // Asked to stop before the camera could be opened; there is nothing to run.
+            None => Ok(()),
+            Some(source) => {
+                let mut stopped = shutdown_rx.clone();
                 let shutdown = async move {
-                    let _ = shutdown_rx.await;
+                    let _ = stopped.changed().await;
                 };
                 run(client_config, source, shutdown)
                     .await
                     .map_err(|error| error.to_string())
             }
-            Err(error) => Err(format!("could not open the camera: {error}")),
         };
 
         stats.abort();
@@ -219,6 +332,18 @@ pub async fn start_agent(config: AgentConfig) -> Result<(), String> {
         let mut slot = AGENT.lock().unwrap_or_else(|error| error.into_inner());
         if slot.generation == generation {
             slot.shutdown = None;
+            slot.commands = None;
+        }
+    });
+
+    // The run task's own result is waited for below, by the next start, and only to know when the
+    // camera is free again; a panic in it would otherwise leave the UI believing the agent is
+    // alive. This monitor is what the slot waits for, and it reports such an ending.
+    let task = runtime.spawn(async move {
+        if let Err(error) = agent.await {
+            emit(AgentEvent::Error {
+                message: format!("the agent task ended unexpectedly: {error}"),
+            });
         }
     });
 
@@ -232,11 +357,141 @@ pub async fn start_agent(config: AgentConfig) -> Result<(), String> {
 /// Stops the background agent, if one runs.
 ///
 /// Returns without waiting: the loop notices the signal at its next await point, and a later
-/// [`start_agent`] waits for it to wind down before touching the camera again.
+/// [`start_agent`] waits for it to wind down before touching the camera again. It also ends the
+/// camera retries and any wait for the server, so nothing brings a stopped agent back.
 pub fn stop_agent() {
     let mut slot = AGENT.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(shutdown) = slot.shutdown.take() {
-        let _ = shutdown.send(());
+        let _ = shutdown.send(true);
+    }
+}
+
+/// Moves the running agent's capture pipeline onto new parameters.
+///
+/// The switch travels the same path a `switch_camera` command from the server does: applied at
+/// once while no stream is live, and once the active stream ends otherwise, the last request
+/// winning. An empty `bitrate_kbps` — a bitrate field the operator left alone — lets the client
+/// derive one from the codec, the resolution and the frame rate. Fails when no agent runs, and
+/// when the codec is not one this client encodes.
+#[frb(sync)]
+pub fn apply_capture_params(
+    resolution: String,
+    fps: u32,
+    codec: String,
+    bitrate_kbps: Option<u32>,
+) -> Result<(), String> {
+    let codec = parse_codec(&codec)?;
+    send_command(UiCommand::SwitchParams(SwitchParams {
+        camera_enum: 0,
+        resolution: Some(resolution),
+        fps: Some(fps),
+        codec: Some(codec),
+        bitrate_kbps,
+    }))
+}
+
+/// Stores the server identity and asks a running agent to register again with it.
+///
+/// The identity lives in `<config dir>/sc-webcam/server.json`, next to the capture parameters the
+/// core persists, and is always written: an agent that is not running picks it up at its next
+/// [`start_agent`]. A running agent reconnects at the first opportunity — right away while no
+/// stream is live, and once the live one ends otherwise — so a recording is never cut short by a
+/// configuration change.
+#[frb(sync)]
+pub fn save_server_config(server: String, device_id: String, token: String) -> Result<(), String> {
+    let config = ServerConfig {
+        server,
+        device_id,
+        token,
+    };
+    write_server_config(&config)?;
+
+    // Cloned out of the slot so the lock is not held while the command is handed over; whether an
+    // agent is running is not this call's business, the file is written either way.
+    let commands = AGENT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .commands
+        .clone();
+    if let Some(commands) = commands {
+        let _ = commands.send(UiCommand::Reconnect(config.into_core()));
+    }
+
+    Ok(())
+}
+
+/// The server identity the client was last configured with.
+///
+/// `None` means there is none yet — a fresh install — or the stored one cannot be read. This is
+/// what lets a launch connect without a click: the UI fills its fields from it and starts the
+/// agent.
+#[frb(sync)]
+pub fn load_server_config() -> Option<ServerConfig> {
+    read_server_config()
+}
+
+/// Hands `command` to the running agent.
+///
+/// Fails when no agent runs: a switch has a pipeline to move, so a command nobody can act on is
+/// reported rather than dropped silently.
+fn send_command(command: UiCommand) -> Result<(), String> {
+    let commands = AGENT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .commands
+        .clone();
+    match commands {
+        Some(commands) => commands
+            .send(command)
+            .map_err(|_| "the running agent is gone".to_owned()),
+        None => Err("no agent is running".to_owned()),
+    }
+}
+
+/// Opens the camera, retrying until it works or the agent is asked to stop.
+///
+/// `open` starts the capture session, which can block for as long as the platform takes to bring a
+/// camera up (and, on macOS, to ask for camera access). It also fails for reasons that pass on
+/// their own — another client holding the device, a camera the system is still settling — so the
+/// agent reports every attempt and waits before the next one instead of ending the run. `None`
+/// means the agent was asked to stop while the camera was not up yet.
+async fn open_camera(
+    config: &CaptureConfig,
+    shutdown: &watch::Receiver<bool>,
+    frames: &Arc<AtomicU64>,
+) -> Option<CountingSource<CaptureSource>> {
+    let mut backoff = OPEN_BACKOFF_FIRST;
+    loop {
+        match open(config.clone()) {
+            Ok(source) => {
+                return Some(CountingSource {
+                    inner: source,
+                    frames: Arc::clone(frames),
+                });
+            }
+            Err(error) => {
+                let delay = backoff;
+                backoff = (backoff * 2).min(OPEN_BACKOFF_MAX);
+                emit(AgentEvent::Warn {
+                    message: format!(
+                        "could not open the camera: {error}; retrying in {}s",
+                        delay.as_secs()
+                    ),
+                });
+                if !retry_after(delay, shutdown).await {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// Sleeps for `delay`, reporting `false` when the agent was asked to stop instead.
+async fn retry_after(delay: Duration, shutdown: &watch::Receiver<bool>) -> bool {
+    let mut shutdown = shutdown.clone();
+    tokio::select! {
+        _ = sleep(delay) => true,
+        _ = shutdown.changed() => false,
     }
 }
 
@@ -256,9 +511,12 @@ pub mod simple;
 
 /// The one background agent of this process.
 struct AgentSlot {
-    /// Set while a run is live; sending on it asks the loop to stop.
-    shutdown: Option<oneshot::Sender<()>>,
-    /// The most recent run task, so the next start can wait for it to release the camera.
+    /// Set while a run is live; sending `true` on it asks the run to stop.
+    shutdown: Option<watch::Sender<bool>>,
+    /// The commands of the run that is live, if any: a parameter switch or a reconnect.
+    commands: Option<UnboundedSender<UiCommand>>,
+    /// Monitors the most recent run task: the next start waits on it to know that the camera is
+    /// free, and it reports a run that ended without an error of its own.
     task: Option<JoinHandle<()>>,
     /// Identifies the run a task belongs to, so a task cannot clear a newer agent's slot.
     generation: u64,
@@ -266,9 +524,16 @@ struct AgentSlot {
 
 static AGENT: Mutex<AgentSlot> = Mutex::new(AgentSlot {
     shutdown: None,
+    commands: None,
     task: None,
     generation: 0,
 });
+
+/// First delay before the agent tries the camera again after `open` failed.
+const OPEN_BACKOFF_FIRST: Duration = Duration::from_secs(1);
+
+/// Ceiling of the camera-open backoff; the same shape as the core's reconnect backoff.
+const OPEN_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// Runtime the agent runs on, shared by every run of this process.
 static RUNTIME: LazyLock<Result<Runtime, String>> =
@@ -277,6 +542,12 @@ static RUNTIME: LazyLock<Result<Runtime, String>> =
 /// Dart streams subscribed to [`agent_events`].
 static SUBSCRIBERS: Mutex<Vec<StreamSink<AgentEvent>>> = Mutex::new(Vec::new());
 
+/// Guards the one-time installation of the `tracing` subscriber.
+static LOGGING: Once = Once::new();
+
+/// Reconnect attempts reported since the last attach of the running agent.
+static RECONNECT_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+
 /// Hands `event` to every live subscriber.
 ///
 /// A sink whose Dart subscription is gone rejects the event; that is how dead subscribers are
@@ -284,6 +555,184 @@ static SUBSCRIBERS: Mutex<Vec<StreamSink<AgentEvent>>> = Mutex::new(Vec::new());
 fn emit(event: AgentEvent) {
     let mut subscribers = SUBSCRIBERS.lock().unwrap_or_else(|error| error.into_inner());
     subscribers.retain(|sink| sink.add(event.clone()).is_ok());
+}
+
+/// Turns the core's lifecycle events into [`AgentEvent`]s, until the core drops its sender.
+///
+/// A session ending is followed by [`AgentEvent::Reconnecting`] or by the process stopping, and
+/// [`AgentEvent::Online`] already proves that a stream is live, so neither needs its own event.
+async fn forward_core_events(mut events: UnboundedReceiver<CoreEvent>) {
+    while let Some(event) = events.recv().await {
+        match event {
+            CoreEvent::Registering => emit(AgentEvent::Connecting),
+            CoreEvent::Reconnecting { .. } => {
+                let attempt = RECONNECT_ATTEMPTS.fetch_add(1, Ordering::Relaxed) + 1;
+                emit(AgentEvent::Reconnecting { attempt });
+            }
+            CoreEvent::Warn { message } => emit(AgentEvent::Warn { message }),
+            CoreEvent::ParametersApplied {
+                resolution,
+                fps,
+                codec,
+                bitrate_kbps,
+                ..
+            } => emit(AgentEvent::ParametersApplied {
+                resolution,
+                fps,
+                codec,
+                bitrate_kbps,
+            }),
+            CoreEvent::Notice { message } => emit(AgentEvent::Notice { message }),
+            CoreEvent::Attached => RECONNECT_ATTEMPTS.store(0, Ordering::Relaxed),
+            CoreEvent::SessionStarted | CoreEvent::SessionEnded { .. } => {}
+        }
+    }
+}
+
+/// File the `tracing` subscriber appends to.
+fn log_file_path() -> PathBuf {
+    std::env::temp_dir().join("scwc-agent.log")
+}
+
+/// Directory the client keeps its configuration in, when the platform has one.
+fn config_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("sc-webcam"))
+}
+
+/// File the core remembers the capture parameters the pipeline was last switched to in.
+///
+/// `None` when the platform has no configuration directory: the agent then runs stateless, and
+/// only the memory of a switch is lost.
+fn state_path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("capture-params.json"))
+}
+
+/// File the server identity the client registers with lives in.
+fn server_config_path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("server.json"))
+}
+
+/// Writes the server identity, atomically: a temporary file next to it, then a rename over it, so
+/// a reader never sees half a configuration.
+fn write_server_config(config: &ServerConfig) -> Result<(), String> {
+    let Some(path) = server_config_path() else {
+        return Err("this platform has no configuration directory".to_owned());
+    };
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    }
+
+    let mut temp_name = path.as_os_str().to_owned();
+    temp_name.push(".tmp");
+    let temp = PathBuf::from(temp_name);
+
+    let json = serde_json::to_vec(config).map_err(|error| error.to_string())?;
+    fs::write(&temp, json).map_err(|error| error.to_string())?;
+    fs::rename(&temp, &path).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        error.to_string()
+    })
+}
+
+/// Reads the stored server identity.
+///
+/// `None` covers both "nothing stored yet" and "the stored file is unusable": neither is worth
+/// failing a launch over, and the UI simply starts with empty fields.
+fn read_server_config() -> Option<ServerConfig> {
+    let path = server_config_path()?;
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Installs the process-wide `tracing` subscriber on its first call.
+///
+/// The core, the capture pipeline and the encoding shims all log through `tracing`, which does
+/// nothing at all without a subscriber. The log goes to a file — the app has no console — and
+/// warnings and errors of the client crates are additionally pushed into the event stream, so a
+/// failure inside capture reaches the UI instead of stopping at a log line nobody reads. The file
+/// path is announced once through the stream for the same reason.
+fn init_logging() {
+    LOGGING.call_once(|| {
+        let path = log_file_path();
+        let writer = match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(file) => BoxMakeWriter::new(Arc::new(file)),
+            // An unusable log file must not keep the agent from running; the events still reach
+            // the UI.
+            Err(error) => {
+                eprintln!("scwc-agent: cannot write {}: {error}", path.display());
+                BoxMakeWriter::new(std::io::sink)
+            }
+        };
+
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(writer)
+                    .with_ansi(false)
+                    .with_filter(LevelFilter::INFO),
+            )
+            .with(WarnLayer {});
+        if let Err(error) = subscriber.try_init() {
+            eprintln!("scwc-agent: another tracing subscriber is installed: {error}");
+        }
+
+        emit(AgentEvent::Warn {
+            message: format!("agent log file: {}", path.display()),
+        });
+    });
+}
+
+/// Forwards the client crates' warnings and errors into the event stream.
+///
+/// Without it a failure logged inside [`scwc_capture`] — an encoder giving up, a pipeline that
+/// refuses to rebuild — would only ever reach the log file.
+///
+/// Braced rather than a unit struct: the binding generator parses this module and rejects unit
+/// structs inside it.
+struct WarnLayer {}
+
+/// Crates whose warnings become [`AgentEvent::Warn`]s.
+const WARN_TARGETS: [&str; 3] = ["scwc_core", "scwc_capture", "scwc_protocol"];
+
+impl<S: Subscriber> Layer<S> for WarnLayer {
+    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        let metadata = event.metadata();
+        if *metadata.level() < Level::WARN {
+            return;
+        }
+        if !WARN_TARGETS
+            .iter()
+            .any(|target| metadata.target().starts_with(target))
+        {
+            return;
+        }
+
+        let mut visitor = MessageVisitor { message: None };
+        event.record(&mut visitor);
+        if let Some(message) = visitor.message {
+            emit(AgentEvent::Warn { message });
+        }
+    }
+}
+
+/// Picks the `message` field out of a record and ignores every other field.
+struct MessageVisitor {
+    /// The record's `message` field, if it has one.
+    message: Option<String>,
+}
+
+impl Visit for MessageVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.message = Some(value.to_owned());
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        if field.name() == "message" {
+            self.message = Some(format!("{value:?}"));
+        }
+    }
 }
 
 /// Reports the frame counter once a second until the run task aborts this task.
