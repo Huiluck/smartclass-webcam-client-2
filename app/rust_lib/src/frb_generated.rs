@@ -39,7 +39,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.13.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 978262240;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -858620220;
 
 // Section: executor
 
@@ -82,6 +82,44 @@ fn wire__crate__api__agent_events_impl(
                     std::result::Result::Ok(output_ok)
                 })())
             }
+        },
+    )
+}
+fn wire__crate__api__apply_capture_params_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "apply_capture_params",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_resolution = <String>::sse_decode(&mut deserializer);
+            let api_fps = <u32>::sse_decode(&mut deserializer);
+            let api_codec = <String>::sse_decode(&mut deserializer);
+            let api_bitrate_kbps = <Option<u32>>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, String>((move || {
+                let output_ok = crate::api::apply_capture_params(
+                    api_resolution,
+                    api_fps,
+                    api_codec,
+                    api_bitrate_kbps,
+                )?;
+                std::result::Result::Ok(output_ok)
+            })())
         },
     )
 }
@@ -178,6 +216,139 @@ fn wire__crate__api__list_cameras_impl(
         },
     )
 }
+fn wire__crate__api__load_server_config_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "load_server_config",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Ok::<_, ()>(crate::api::load_server_config())?;
+                std::result::Result::Ok(output_ok)
+            })())
+        },
+    )
+}
+fn wire__crate__api__preview_stream_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "preview_stream",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_sink = <StreamSink<
+                crate::api::PreviewFrame,
+                flutter_rust_bridge::for_generated::SseCodec,
+            >>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, ()>((move || {
+                    let output_ok = Ok::<_, ()>({
+                        crate::api::preview_stream(api_sink);
+                    })?;
+                    std::result::Result::Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__save_server_config_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "save_server_config",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_server = <String>::sse_decode(&mut deserializer);
+            let api_device_id = <String>::sse_decode(&mut deserializer);
+            let api_token = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, String>((move || {
+                let output_ok =
+                    crate::api::save_server_config(api_server, api_device_id, api_token)?;
+                std::result::Result::Ok(output_ok)
+            })())
+        },
+    )
+}
+fn wire__crate__api__set_preview_target_size_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "set_preview_target_size",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_width = <u32>::sse_decode(&mut deserializer);
+            let api_height = <u32>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Ok::<_, ()>({
+                    crate::api::set_preview_target_size(api_width, api_height);
+                })?;
+                std::result::Result::Ok(output_ok)
+            })())
+        },
+    )
+}
 fn wire__crate__api__start_agent_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -269,6 +440,16 @@ impl SseDecode
     }
 }
 
+impl SseDecode
+    for StreamSink<crate::api::PreviewFrame, flutter_rust_bridge::for_generated::SseCodec>
+{
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <String>::sse_decode(deserializer);
+        return StreamSink::deserialize(inner);
+    }
+}
+
 impl SseDecode for String {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -288,7 +469,7 @@ impl SseDecode for crate::api::AgentConfig {
         let mut var_height = <u32>::sse_decode(deserializer);
         let mut var_fps = <u32>::sse_decode(deserializer);
         let mut var_codec = <String>::sse_decode(deserializer);
-        let mut var_bitrateKbps = <u32>::sse_decode(deserializer);
+        let mut var_bitrateKbps = <Option<u32>>::sse_decode(deserializer);
         return crate::api::AgentConfig {
             server: var_server,
             device_id: var_deviceId,
@@ -330,6 +511,30 @@ impl SseDecode for crate::api::AgentEvent {
                 };
             }
             5 => {
+                let mut var_message = <String>::sse_decode(deserializer);
+                return crate::api::AgentEvent::Warn {
+                    message: var_message,
+                };
+            }
+            6 => {
+                let mut var_resolution = <String>::sse_decode(deserializer);
+                let mut var_fps = <u32>::sse_decode(deserializer);
+                let mut var_codec = <String>::sse_decode(deserializer);
+                let mut var_bitrateKbps = <u32>::sse_decode(deserializer);
+                return crate::api::AgentEvent::ParametersApplied {
+                    resolution: var_resolution,
+                    fps: var_fps,
+                    codec: var_codec,
+                    bitrate_kbps: var_bitrateKbps,
+                };
+            }
+            7 => {
+                let mut var_message = <String>::sse_decode(deserializer);
+                return crate::api::AgentEvent::Notice {
+                    message: var_message,
+                };
+            }
+            8 => {
                 let mut var_sentFrames = <u64>::sse_decode(deserializer);
                 let mut var_droppedFrames = <u64>::sse_decode(deserializer);
                 return crate::api::AgentEvent::Stats {
@@ -337,7 +542,7 @@ impl SseDecode for crate::api::AgentEvent {
                     dropped_frames: var_droppedFrames,
                 };
             }
-            6 => {
+            9 => {
                 let mut var_message = <String>::sse_decode(deserializer);
                 return crate::api::AgentEvent::Error {
                     message: var_message,
@@ -412,12 +617,62 @@ impl SseDecode for Vec<(String, Vec<u32>)> {
     }
 }
 
+impl SseDecode for Option<crate::api::ServerConfig> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        if (<bool>::sse_decode(deserializer)) {
+            return Some(<crate::api::ServerConfig>::sse_decode(deserializer));
+        } else {
+            return None;
+        }
+    }
+}
+
+impl SseDecode for Option<u32> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        if (<bool>::sse_decode(deserializer)) {
+            return Some(<u32>::sse_decode(deserializer));
+        } else {
+            return None;
+        }
+    }
+}
+
+impl SseDecode for crate::api::PreviewFrame {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_rgba = <Vec<u8>>::sse_decode(deserializer);
+        let mut var_width = <u32>::sse_decode(deserializer);
+        let mut var_height = <u32>::sse_decode(deserializer);
+        return crate::api::PreviewFrame {
+            rgba: var_rgba,
+            width: var_width,
+            height: var_height,
+        };
+    }
+}
+
 impl SseDecode for (String, Vec<u32>) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         let mut var_field0 = <String>::sse_decode(deserializer);
         let mut var_field1 = <Vec<u32>>::sse_decode(deserializer);
         return (var_field0, var_field1);
+    }
+}
+
+impl SseDecode for crate::api::ServerConfig {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_server = <String>::sse_decode(deserializer);
+        let mut var_deviceId = <String>::sse_decode(deserializer);
+        let mut var_token = <String>::sse_decode(deserializer);
+        return crate::api::ServerConfig {
+            server: var_server,
+            device_id: var_deviceId,
+            token: var_token,
+        };
     }
 }
 
@@ -471,9 +726,10 @@ fn pde_ffi_dispatcher_primary_impl(
     // Codec=Pde (Serialization + dispatch), see doc to use other codecs
     match func_id {
         1 => wire__crate__api__agent_events_impl(port, ptr, rust_vec_len, data_len),
-        3 => wire__crate__api__simple__init_app_impl(port, ptr, rust_vec_len, data_len),
-        5 => wire__crate__api__start_agent_impl(port, ptr, rust_vec_len, data_len),
-        6 => wire__crate__api__stop_agent_impl(port, ptr, rust_vec_len, data_len),
+        4 => wire__crate__api__simple__init_app_impl(port, ptr, rust_vec_len, data_len),
+        7 => wire__crate__api__preview_stream_impl(port, ptr, rust_vec_len, data_len),
+        10 => wire__crate__api__start_agent_impl(port, ptr, rust_vec_len, data_len),
+        11 => wire__crate__api__stop_agent_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -486,8 +742,12 @@ fn pde_ffi_dispatcher_sync_impl(
 ) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
     // Codec=Pde (Serialization + dispatch), see doc to use other codecs
     match func_id {
-        2 => wire__crate__api__simple__greet_impl(ptr, rust_vec_len, data_len),
-        4 => wire__crate__api__list_cameras_impl(ptr, rust_vec_len, data_len),
+        2 => wire__crate__api__apply_capture_params_impl(ptr, rust_vec_len, data_len),
+        3 => wire__crate__api__simple__greet_impl(ptr, rust_vec_len, data_len),
+        5 => wire__crate__api__list_cameras_impl(ptr, rust_vec_len, data_len),
+        6 => wire__crate__api__load_server_config_impl(ptr, rust_vec_len, data_len),
+        8 => wire__crate__api__save_server_config_impl(ptr, rust_vec_len, data_len),
+        9 => wire__crate__api__set_preview_target_size_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -530,17 +790,36 @@ impl flutter_rust_bridge::IntoDart for crate::api::AgentEvent {
             crate::api::AgentEvent::Reconnecting { attempt } => {
                 [4.into_dart(), attempt.into_into_dart().into_dart()].into_dart()
             }
+            crate::api::AgentEvent::Warn { message } => {
+                [5.into_dart(), message.into_into_dart().into_dart()].into_dart()
+            }
+            crate::api::AgentEvent::ParametersApplied {
+                resolution,
+                fps,
+                codec,
+                bitrate_kbps,
+            } => [
+                6.into_dart(),
+                resolution.into_into_dart().into_dart(),
+                fps.into_into_dart().into_dart(),
+                codec.into_into_dart().into_dart(),
+                bitrate_kbps.into_into_dart().into_dart(),
+            ]
+            .into_dart(),
+            crate::api::AgentEvent::Notice { message } => {
+                [7.into_dart(), message.into_into_dart().into_dart()].into_dart()
+            }
             crate::api::AgentEvent::Stats {
                 sent_frames,
                 dropped_frames,
             } => [
-                5.into_dart(),
+                8.into_dart(),
                 sent_frames.into_into_dart().into_dart(),
                 dropped_frames.into_into_dart().into_dart(),
             ]
             .into_dart(),
             crate::api::AgentEvent::Error { message } => {
-                [6.into_dart(), message.into_into_dart().into_dart()].into_dart()
+                [9.into_dart(), message.into_into_dart().into_dart()].into_dart()
             }
             _ => {
                 unimplemented!("");
@@ -571,6 +850,40 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::CameraInfoDto> for crate::api
         self
     }
 }
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::PreviewFrame {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.rgba.into_into_dart().into_dart(),
+            self.width.into_into_dart().into_dart(),
+            self.height.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::PreviewFrame {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::PreviewFrame> for crate::api::PreviewFrame {
+    fn into_into_dart(self) -> crate::api::PreviewFrame {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::ServerConfig {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.server.into_into_dart().into_dart(),
+            self.device_id.into_into_dart().into_dart(),
+            self.token.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::ServerConfig {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::ServerConfig> for crate::api::ServerConfig {
+    fn into_into_dart(self) -> crate::api::ServerConfig {
+        self
+    }
+}
 
 impl SseEncode for flutter_rust_bridge::for_generated::anyhow::Error {
     // Codec=Sse (Serialization based), see doc to use other codecs
@@ -581,6 +894,15 @@ impl SseEncode for flutter_rust_bridge::for_generated::anyhow::Error {
 
 impl SseEncode
     for StreamSink<crate::api::AgentEvent, flutter_rust_bridge::for_generated::SseCodec>
+{
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        unimplemented!("")
+    }
+}
+
+impl SseEncode
+    for StreamSink<crate::api::PreviewFrame, flutter_rust_bridge::for_generated::SseCodec>
 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -606,7 +928,7 @@ impl SseEncode for crate::api::AgentConfig {
         <u32>::sse_encode(self.height, serializer);
         <u32>::sse_encode(self.fps, serializer);
         <String>::sse_encode(self.codec, serializer);
-        <u32>::sse_encode(self.bitrate_kbps, serializer);
+        <Option<u32>>::sse_encode(self.bitrate_kbps, serializer);
     }
 }
 
@@ -631,16 +953,36 @@ impl SseEncode for crate::api::AgentEvent {
                 <i32>::sse_encode(4, serializer);
                 <u32>::sse_encode(attempt, serializer);
             }
+            crate::api::AgentEvent::Warn { message } => {
+                <i32>::sse_encode(5, serializer);
+                <String>::sse_encode(message, serializer);
+            }
+            crate::api::AgentEvent::ParametersApplied {
+                resolution,
+                fps,
+                codec,
+                bitrate_kbps,
+            } => {
+                <i32>::sse_encode(6, serializer);
+                <String>::sse_encode(resolution, serializer);
+                <u32>::sse_encode(fps, serializer);
+                <String>::sse_encode(codec, serializer);
+                <u32>::sse_encode(bitrate_kbps, serializer);
+            }
+            crate::api::AgentEvent::Notice { message } => {
+                <i32>::sse_encode(7, serializer);
+                <String>::sse_encode(message, serializer);
+            }
             crate::api::AgentEvent::Stats {
                 sent_frames,
                 dropped_frames,
             } => {
-                <i32>::sse_encode(5, serializer);
+                <i32>::sse_encode(8, serializer);
                 <u64>::sse_encode(sent_frames, serializer);
                 <u64>::sse_encode(dropped_frames, serializer);
             }
             crate::api::AgentEvent::Error { message } => {
-                <i32>::sse_encode(6, serializer);
+                <i32>::sse_encode(9, serializer);
                 <String>::sse_encode(message, serializer);
             }
             _ => {
@@ -699,11 +1041,49 @@ impl SseEncode for Vec<(String, Vec<u32>)> {
     }
 }
 
+impl SseEncode for Option<crate::api::ServerConfig> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.is_some(), serializer);
+        if let Some(value) = self {
+            <crate::api::ServerConfig>::sse_encode(value, serializer);
+        }
+    }
+}
+
+impl SseEncode for Option<u32> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.is_some(), serializer);
+        if let Some(value) = self {
+            <u32>::sse_encode(value, serializer);
+        }
+    }
+}
+
+impl SseEncode for crate::api::PreviewFrame {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <Vec<u8>>::sse_encode(self.rgba, serializer);
+        <u32>::sse_encode(self.width, serializer);
+        <u32>::sse_encode(self.height, serializer);
+    }
+}
+
 impl SseEncode for (String, Vec<u32>) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         <String>::sse_encode(self.0, serializer);
         <Vec<u32>>::sse_encode(self.1, serializer);
+    }
+}
+
+impl SseEncode for crate::api::ServerConfig {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.server, serializer);
+        <String>::sse_encode(self.device_id, serializer);
+        <String>::sse_encode(self.token, serializer);
     }
 }
 

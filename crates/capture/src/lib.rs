@@ -72,6 +72,15 @@
 //! frames are dropped and keyframes wait for space, mirroring the core's own drop policy:
 //! a decoder can always recover at the next IDR, but a dropped IDR costs a whole GOP.
 //!
+//! # Live preview
+//!
+//! Every backend also offers the frames it captures to
+//! [`scwc_core::preview`](scwc_core::preview), which converts them to RGBA, scales them to the
+//! size the interface asked for and hands them to whoever registered a sink there. The
+//! conversion is skipped entirely while no preview is wanted, so a client whose interface shows
+//! no picture pays nothing for the path: the Apple shim asks a gate before it renders a frame,
+//! and the Linux and Windows backends ask before they convert one.
+//!
 //! # Example
 //!
 //! ```no_run

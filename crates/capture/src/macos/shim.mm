@@ -57,6 +57,15 @@
   void *_frameUser;
   scwc_mac_status_cb _statusCallback;
   void *_statusUser;
+  /// Preview state, guarded by `_previewLock`: the callback and its gate, and the tight BGRA
+  /// buffer frames are converted into. The lock is held across a conversion, so a registration
+  /// and a frame being converted cannot interleave; nothing else is held while it is, and the
+  /// Rust side the conversion hands the frame to never re-enters this object.
+  scwc_mac_preview_cb _previewCallback;
+  void *_previewUser;
+  scwc_mac_preview_wanted_cb _previewWanted;
+  std::mutex _previewLock;
+  std::vector<uint8_t> _previewPixels;
   int32_t _codec;
   uint32_t _width;
   uint32_t _height;
@@ -64,10 +73,14 @@
   uint32_t _bitrateKbps;
   std::string _cameraId;
   bool _shutDown;
-#if TARGET_OS_IPHONE
+  /// Whether the pipeline has already reported a hard failure: an encoder that is dead stays
+  /// dead, so the operator gets one report instead of one per frame.
+  bool _failureReported;
   /// Notification tokens, kept so `teardown` can cancel the subscriptions.
-  id _thermalObserver;
+  id _runtimeErrorObserver;
   id _interruptionObserver;
+#if TARGET_OS_IPHONE
+  id _thermalObserver;
   id _interruptionEndedObserver;
   /// The last thermal state reported to Rust, so only transitions are logged.
   int32_t _lastThermalState;
@@ -85,7 +98,14 @@
 - (void)shutdown;
 /// Publishes the device status callback `scwc_mac_set_status_cb` registers.
 - (void)setStatusCallback:(scwc_mac_status_cb)callback user:(void *)user;
-/// Subscribes to the notifications that report thermal pressure and session interruptions.
+/// Publishes the preview callback `scwc_mac_set_preview_cb` registers, and the gate it is
+/// consulted through.
+- (void)setPreviewCallback:(scwc_mac_preview_cb)callback
+                      user:(void *)user
+                    wanted:(scwc_mac_preview_wanted_cb)wanted;
+/// Converts one captured frame to BGRA and hands it to Rust, unless nothing wants it.
+- (void)publishPreview:(CVPixelBufferRef)pixel_buffer;
+/// Subscribes to the notifications that report a failed session and thermal pressure.
 - (void)subscribeNotifications;
 /// Cancels those subscriptions; afterwards no notification block reaches this object again.
 - (void)unsubscribeNotifications;
@@ -100,6 +120,15 @@
 @end
 
 namespace {
+
+/// One set of capture parameters, as a start or a reconfiguration receives them.
+struct CaptureParameters {
+  uint32_t width;
+  uint32_t height;
+  uint32_t fps;
+  int32_t codec;
+  uint32_t bitrate_kbps;
+};
 
 /// Failure reported by the last call on this thread.
 thread_local int32_t gLastCode = SCWC_MAC_OK;
@@ -452,6 +481,29 @@ NSData *encode_jpeg(CVPixelBufferRef pixel_buffer) {
   }
 }
 
+/// The CoreImage context preview frames are converted with.
+///
+/// One context for the process, like the one the photo path uses: creating one per frame would
+/// cost more than the conversion.
+CIContext *preview_context() {
+  static CIContext *context = nil;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    context = [CIContext contextWithOptions:nil];
+  });
+  return context;
+}
+
+/// The colour space a preview frame is converted into.
+CGColorSpaceRef preview_color_space() {
+  static CGColorSpaceRef space = NULL;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+  });
+  return space;
+}
+
 /// One enumerated resolution with the frame rates announced for it.
 struct ResolutionRow {
   uint32_t width;
@@ -487,15 +539,20 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
     _frameUser = NULL;
     _statusCallback = NULL;
     _statusUser = NULL;
+    _previewCallback = NULL;
+    _previewUser = NULL;
+    _previewWanted = NULL;
     _codec = 0;
     _width = 0;
     _height = 0;
     _fps = 0;
     _bitrateKbps = 0;
     _shutDown = false;
+    _failureReported = false;
+    _runtimeErrorObserver = nil;
+    _interruptionObserver = nil;
 #if TARGET_OS_IPHONE
     _thermalObserver = nil;
-    _interruptionObserver = nil;
     _interruptionEndedObserver = nil;
     // No state has been reported yet, so the first one this shim sees is a transition.
     _lastThermalState = -1;
@@ -522,23 +579,37 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
   }
 
   _cameraId = from_c_string(cfg->camera_id);
-  _width = cfg->width;
-  _height = cfg->height;
-  _fps = cfg->fps;
-  _codec = cfg->codec;
-  _bitrateKbps = cfg->bitrate_kbps;
   [self setCallback:callback user:user];
 
   int32_t code = [self selectDevice];
   if (code != SCWC_MAC_OK) {
     return code;
   }
-  code = [self buildPipeline];
+
+  CaptureParameters parameters = {cfg->width, cfg->height, cfg->fps, cfg->codec,
+                                  cfg->bitrate_kbps};
+  AVCaptureDeviceFormat *format = nil;
+  AVCaptureSession *session = nil;
+  AVCaptureVideoDataOutput *output = nil;
+  VTCompressionSessionRef encoder = NULL;
+  code = [self buildPipelineWithParameters:parameters
+                                   format:&format
+                                  session:&session
+                                   output:&output
+                                  encoder:&encoder];
   if (code != SCWC_MAC_OK) {
-    [self teardown];
     return code;
   }
-  return SCWC_MAC_OK;
+  code = [self applyFormat:format fps:parameters.fps];
+  if (code != SCWC_MAC_OK) {
+    // Nothing has been published yet, so only the encoder built above has to go.
+    [self disposeEncoder:encoder];
+    return code;
+  }
+
+  [self publishParameters:parameters format:format session:session output:output encoder:encoder];
+  [self subscribeNotifications];
+  return [self startLiveSession];
 }
 
 - (int32_t)setWidth:(uint32_t)width
@@ -559,30 +630,65 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
     return SCWC_MAC_OK;
   }
 
-  // Validate against the device before anything is torn down, so a rejected request leaves
-  // the running pipeline alone.
-  if (pick_format(_device, width, height, fps) == nil) {
-    return fail(SCWC_MAC_ERR_UNSUPPORTED,
-                [NSString stringWithFormat:@"%@ cannot capture %ux%u at %u fps",
-                                           _device.localizedName, width, height, fps]);
-  }
+  CaptureParameters parameters = {width, height, fps, codec, bitrate};
 
-  scwc_mac_frame_cb callback = _frameCallback;
-  void *user = _frameUser;
-  [self teardown];
-
-  _width = width;
-  _height = height;
-  _fps = fps;
-  _codec = codec;
-  _bitrateKbps = bitrate;
-  [self setCallback:callback user:user];
-
-  int32_t code = [self buildPipeline];
+  // The replacement is built and validated before the running pipeline is touched, so a
+  // request the device or VideoToolbox refuses leaves the camera streaming on the parameters
+  // it already has.
+  AVCaptureDeviceFormat *format = nil;
+  AVCaptureSession *session = nil;
+  AVCaptureVideoDataOutput *output = nil;
+  VTCompressionSessionRef encoder = NULL;
+  int32_t code = [self buildPipelineWithParameters:parameters
+                                            format:&format
+                                           session:&session
+                                            output:&output
+                                           encoder:&encoder];
   if (code != SCWC_MAC_OK) {
-    [self teardown];
     return code;
   }
+
+  // The live pipeline, kept until the replacement runs: it is what a failure puts back.
+  CaptureParameters live = {_width, _height, _fps, _codec, _bitrateKbps};
+  AVCaptureDeviceFormat *liveFormat = _format;
+  AVCaptureSession *liveSession = _session;
+  AVCaptureVideoDataOutput *liveOutput = _output;
+  VTCompressionSessionRef liveEncoder = _encoder;
+
+  // Capture stops here: the device is handed to the replacement, and a frame still queued for
+  // the old encoder would otherwise race the swap. The session keeps its input and output, so
+  // it can start again as it is.
+  [self unsubscribeNotifications];
+  [self stopLiveSession];
+
+  code = [self applyFormat:format fps:parameters.fps];
+  if (code != SCWC_MAC_OK) {
+    // The device kept the live format, and the live pipeline only has to start again.
+    [self restorePipeline:live
+                   format:liveFormat
+                  session:liveSession
+                   output:liveOutput
+                  encoder:liveEncoder];
+    [self disposeEncoder:encoder];
+    return code;
+  }
+
+  [self publishParameters:parameters format:format session:session output:output encoder:encoder];
+  [self subscribeNotifications];
+  code = [self startLiveSession];
+  if (code != SCWC_MAC_OK) {
+    // The replacement never ran, so the pipeline that was streaming goes back in its place,
+    // on the parameters it was using.
+    [self restorePipeline:live
+                   format:liveFormat
+                  session:liveSession
+                   output:liveOutput
+                  encoder:liveEncoder];
+    [self disposeEncoder:encoder];
+    return code;
+  }
+
+  [self disposeEncoder:liveEncoder];
   return SCWC_MAC_OK;
 }
 
@@ -642,18 +748,114 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
   _statusUser = user;
 }
 
-/// Subscribes to the notifications that report thermal pressure and session interruptions.
+/// Publishes the preview callback and the gate it is consulted through; `NULL` stops it.
 ///
-/// Both are iOS concerns: a macOS session reports what happens to it through runtime errors
-/// instead, and its thermal state is not part of this backend's contract, so macOS
-/// subscribes to nothing and keeps the behaviour it has always had.
+/// Like the status callback, this outlives a reconfigure: a `switch_camera` changes what the
+/// camera captures, not whether its picture is shown.
+- (void)setPreviewCallback:(scwc_mac_preview_cb)callback
+                      user:(void *)user
+                    wanted:(scwc_mac_preview_wanted_cb)wanted {
+  std::lock_guard<std::mutex> guard(_previewLock);
+  _previewCallback = callback;
+  _previewUser = user;
+  _previewWanted = wanted;
+  if (callback == NULL) {
+    // Nothing will ask for the pixels again, so the buffer can go.
+    _previewPixels.clear();
+    _previewPixels.shrink_to_fit();
+  }
+}
+
+/// Converts one captured frame to tightly packed BGRA and hands it to Rust.
+///
+/// Runs on the capture queue, for every frame, and only while Rust says the picture is wanted:
+/// the conversion reads the whole frame, so a preview nobody looks at must not pay for it. The
+/// frame is handed over at the camera's own size — scaling it to the size the interface shows
+/// it in is the Rust side's job — as one tightly packed buffer, so Rust needs no knowledge of
+/// CoreVideo's row padding.
+- (void)publishPreview:(CVPixelBufferRef)pixel_buffer {
+  std::lock_guard<std::mutex> guard(_previewLock);
+  if (_previewCallback == NULL || _previewWanted == NULL || _previewWanted(_previewUser) == 0) {
+    return;
+  }
+
+  const size_t width = CVPixelBufferGetWidth(pixel_buffer);
+  const size_t height = CVPixelBufferGetHeight(pixel_buffer);
+  if (width == 0 || height == 0) {
+    return;
+  }
+
+  const size_t row_bytes = width * 4;
+  _previewPixels.resize(row_bytes * height);
+  @autoreleasepool {
+    CIImage *image = [CIImage imageWithCVPixelBuffer:pixel_buffer];
+    [preview_context() render:image
+                     toBitmap:_previewPixels.data()
+                     rowBytes:(ptrdiff_t)row_bytes
+                       bounds:image.extent
+                       format:kCIFormatBGRA8
+                   colorSpace:preview_color_space()];
+  }
+
+  _previewCallback(_previewUser, _previewPixels.data(), _previewPixels.size(), (uint32_t)width,
+                   (uint32_t)height);
+}
+
+/// Reports one hard failure of the pipeline through the status callback, at most once.
+///
+/// A pipeline that fails keeps failing — an encoder whose session died reports a status on
+/// every frame — so only the first failure is reported: Rust learns that capture broke, and
+/// the platform log names it once instead of once per frame. The report is reset when a new
+/// pipeline takes over, which gets its own first failure.
+- (void)reportFailure:(NSString *)message {
+  std::lock_guard<std::mutex> guard(_callbackLock);
+  [self reportFailureLocked:message];
+}
+
+/// `reportFailure:` for the paths that already hold `_callbackLock`.
+- (void)reportFailureLocked:(NSString *)message {
+  if (_failureReported) {
+    return;
+  }
+  _failureReported = true;
+  NSLog(@"[scwc-capture] %@", message);
+  if (_shutDown || _statusCallback == NULL) {
+    return;
+  }
+  _statusCallback(_statusUser, SCWC_MAC_STATUS_FAILURE);
+}
+
+/// Subscribes to the notifications that report a failed session, and on iOS the thermal
+/// pressure and the interruptions a phone call or a background app causes.
+///
+/// A session that dies mid-stream says so through a runtime error on both platforms — on
+/// macOS that notification is the only word the shim ever gets about it — so it is the one
+/// subscription both platforms share. macOS adds the interruption another application taking
+/// the camera causes; the system hands the device back on its own once that application is
+/// done, so nothing there restarts anything.
 - (void)subscribeNotifications {
-#if TARGET_OS_IPHONE
   __weak ScwcMacCapture *weakSelf = self;
   // The observers are registered against the session, and the restart below only applies to
   // that same session: a reconfigure builds a new one.
   AVCaptureSession *session = _session;
 
+  _runtimeErrorObserver = [[NSNotificationCenter defaultCenter]
+      addObserverForName:AVCaptureSessionRuntimeErrorNotification
+                  object:session
+                   queue:nil
+              usingBlock:^(NSNotification *notification) {
+                ScwcMacCapture *capture = weakSelf;
+                if (capture == nil) {
+                  return;
+                }
+                NSError *error = notification.userInfo[AVCaptureSessionErrorKey];
+                NSString *reason = error != nil ? error.localizedDescription : @"unknown reason";
+                [capture reportFailure:[NSString stringWithFormat:@"the capture session failed "
+                                                                   @"at runtime: %@",
+                                                                  reason]];
+              }];
+
+#if TARGET_OS_IPHONE
   if (@available(iOS 11.0, *)) {
     _thermalObserver = [[NSNotificationCenter defaultCenter]
         addObserverForName:NSProcessInfoThermalStateDidChangeNotification
@@ -704,6 +906,21 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
                   }
                 });
               }];
+#else
+  // Nothing to restart here: the notification carries no interruption reason on macOS, and
+  // the system resumes what it interrupted.
+  _interruptionObserver = [[NSNotificationCenter defaultCenter]
+      addObserverForName:AVCaptureSessionWasInterruptedNotification
+                  object:session
+                   queue:nil
+              usingBlock:^(NSNotification *notification) {
+                (void)notification;
+                ScwcMacCapture *capture = weakSelf;
+                if (capture != nil) {
+                  [capture reportFailure:@"the capture session was interrupted; another "
+                                          @"application may have taken the camera"];
+                }
+              }];
 #endif
 }
 
@@ -712,21 +929,175 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
 /// A block that is already running is left to finish, which is why the interrupt handlers
 /// check the lock-protected state before they act.
 - (void)unsubscribeNotifications {
-#if TARGET_OS_IPHONE
   NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
-  if (_thermalObserver != nil) {
-    [center removeObserver:_thermalObserver];
-    _thermalObserver = nil;
+  if (_runtimeErrorObserver != nil) {
+    [center removeObserver:_runtimeErrorObserver];
+    _runtimeErrorObserver = nil;
   }
   if (_interruptionObserver != nil) {
     [center removeObserver:_interruptionObserver];
     _interruptionObserver = nil;
+  }
+#if TARGET_OS_IPHONE
+  if (_thermalObserver != nil) {
+    [center removeObserver:_thermalObserver];
+    _thermalObserver = nil;
   }
   if (_interruptionEndedObserver != nil) {
     [center removeObserver:_interruptionEndedObserver];
     _interruptionEndedObserver = nil;
   }
 #endif
+}
+
+/// Makes `format` the device's active format, at `fps`.
+///
+/// The device is one object, shared by every session of the process: the change reaches the
+/// session that is running through it, which is why this is only called once the pipeline
+/// being replaced is done with the device.
+- (int32_t)applyFormat:(AVCaptureDeviceFormat *)format fps:(uint32_t)fps {
+  if (format == nil) {
+    return fail(SCWC_MAC_ERR_UNSUPPORTED, @"no capture format is available for the device");
+  }
+
+  NSError *error = nil;
+  if (![_device lockForConfiguration:&error]) {
+    return fail(SCWC_MAC_ERR_OS, [NSString stringWithFormat:@"cannot configure %@: %@",
+                                                            _device.localizedName,
+                                                            error.localizedDescription]);
+  }
+  // AVFoundation raises rather than returns an error for a format or duration it rejects.
+  @try {
+    [_device setActiveFormat:format];
+    CMTime duration = frame_duration(format, fps);
+    [_device setActiveVideoMinFrameDuration:duration];
+    [_device setActiveVideoMaxFrameDuration:duration];
+  } @catch (NSException *exception) {
+    [_device unlockForConfiguration];
+    CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+    return fail(SCWC_MAC_ERR_UNSUPPORTED,
+                [NSString stringWithFormat:@"%@ rejected %ux%u at %u fps: %@",
+                                           _device.localizedName, (uint32_t)dimensions.width,
+                                           (uint32_t)dimensions.height, fps, exception.reason]);
+  }
+  [_device unlockForConfiguration];
+  return SCWC_MAC_OK;
+}
+
+/// Makes the pipeline built for `parameters` the live one.
+- (void)publishParameters:(const CaptureParameters &)parameters
+                   format:(AVCaptureDeviceFormat *)format
+                  session:(AVCaptureSession *)session
+                   output:(AVCaptureVideoDataOutput *)output
+                  encoder:(VTCompressionSessionRef)encoder {
+  _width = parameters.width;
+  _height = parameters.height;
+  _fps = parameters.fps;
+  _codec = parameters.codec;
+  _bitrateKbps = parameters.bitrate_kbps;
+  _format = format;
+  {
+    // Held while the live session changes hands: it is the lock the iOS interruption handler
+    // takes, so a session that is no longer the live one is never restarted by a late
+    // interruption notification.
+    std::lock_guard<std::mutex> guard(_sessionLock);
+    _session = session;
+    _output = output;
+  }
+  _encoder = encoder;
+  // The still `take_photo` would hand out belongs to the pipeline that just went away, so the
+  // next frame of this one is the first still it can offer.
+  {
+    std::lock_guard<std::mutex> guard(_photoLock);
+    if (_latestPixelBuffer != NULL) {
+      CFRelease(_latestPixelBuffer);
+      _latestPixelBuffer = NULL;
+    }
+  }
+  // The pipeline that starts here gets its own first failure to report; the one before it has
+  // used up the report the operator already has.
+  std::lock_guard<std::mutex> guard(_callbackLock);
+  _failureReported = false;
+}
+
+/// Puts a pipeline that was running back in place, with the parameters it had.
+///
+/// Used when a reconfiguration fails after it took the running pipeline out of service: the
+/// session kept its input and its output, so it starts again on the format and parameters the
+/// operator chose before the request.
+- (void)restorePipeline:(const CaptureParameters &)parameters
+                 format:(AVCaptureDeviceFormat *)format
+                session:(AVCaptureSession *)session
+                 output:(AVCaptureVideoDataOutput *)output
+                encoder:(VTCompressionSessionRef)encoder {
+  [self unsubscribeNotifications];
+  [self publishParameters:parameters format:format session:session output:output encoder:encoder];
+  (void)[self applyFormat:format fps:parameters.fps];
+  [self subscribeNotifications];
+  // Best effort: the failure being returned is the one that has to reach the caller.
+  (void)[self startLiveSession];
+}
+
+/// Starts the live session.
+- (int32_t)startLiveSession {
+  AVCaptureSession *session = _session;
+  if (session == nil) {
+    return fail(SCWC_MAC_ERR_OS, @"the capture session is gone");
+  }
+  @try {
+    [session startRunning];
+  } @catch (NSException *exception) {
+    return fail(SCWC_MAC_ERR_OS, [NSString stringWithFormat:@"capture session failed to start: %@",
+                                                            exception.reason]);
+  }
+  if (![session isRunning]) {
+    return fail(SCWC_MAC_ERR_OS, [NSString stringWithFormat:@"capture session did not start for %@",
+                                                            _device.localizedName]);
+  }
+  return SCWC_MAC_OK;
+}
+
+/// Takes the live session out of service and drains the delegate queue.
+///
+/// Used before a replacement pipeline takes over: a frame already queued for the delegate or
+/// inside the encoder finishes before this returns, so nothing that follows races the old
+/// pipeline. The session itself, its input and its output are left alone — that is what lets
+/// a failed rebuild start it again — but it is no longer the live session, so an interruption
+/// ending on the delegate queue cannot restart what is being replaced.
+- (void)stopLiveSession {
+  AVCaptureSession *session = nil;
+  {
+    // Shared with the iOS interruption handler, which restarts the session from the delegate
+    // queue.
+    std::lock_guard<std::mutex> guard(_sessionLock);
+    session = _session;
+    _session = nil;
+    _output = nil;
+  }
+  if (session != nil && [session isRunning]) {
+    [session stopRunning];
+  }
+  // Drain the delegate queue: a `captureOutput:` already enqueued would run otherwise.
+  if (_delegateQueue != NULL) {
+    dispatch_sync(_delegateQueue, ^{
+    });
+  }
+}
+
+/// Invalidates an encoder and releases it once no callback can still be inside it.
+- (void)disposeEncoder:(VTCompressionSessionRef)encoder {
+  if (encoder == NULL) {
+    return;
+  }
+  // The frames it still holds are finished and delivered before it is torn down: an
+  // invalidation with frames pending returns each of them as a failure, and a pipeline that
+  // is only being replaced has not failed. Release afterwards, under the callback lock, once
+  // no callback can still be inside the encoder — VideoToolbox then has no thread left to run
+  // this shim's callback on.
+  VTCompressionSessionCompleteFrames(encoder, kCMTimeInvalid);
+  VTCompressionSessionInvalidate(encoder);
+  std::lock_guard<std::mutex> guard(_callbackLock);
+  CFRelease(encoder);
 }
 
 #if TARGET_OS_IPHONE
@@ -864,66 +1235,55 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
   return SCWC_MAC_OK;
 }
 
-/// Turns on the requested format and frame rate, then starts session and encoder.
-- (int32_t)buildPipeline {
+/// Builds a capture pipeline for `parameters`, without publishing or starting it.
+///
+/// The pipeline that is running is left alone — including the device's active format, which
+/// is `applyFormat:`'s to set — so a build the device or VideoToolbox refuses cannot disturb
+/// the frames it is delivering. The caller owns the encoder it gets back.
+- (int32_t)buildPipelineWithParameters:(const CaptureParameters &)parameters
+                                format:(AVCaptureDeviceFormat *__strong *)outFormat
+                               session:(AVCaptureSession *__strong *)outSession
+                                output:(AVCaptureVideoDataOutput *__strong *)outOutput
+                               encoder:(VTCompressionSessionRef *)outEncoder {
   if (_device == nil) {
     return fail(SCWC_MAC_ERR_NO_CAMERA, @"the capture device is gone");
   }
 
-  AVCaptureDeviceFormat *format = pick_format(_device, _width, _height, _fps);
+  AVCaptureDeviceFormat *format =
+      pick_format(_device, parameters.width, parameters.height, parameters.fps);
   if (format == nil) {
     return fail(SCWC_MAC_ERR_UNSUPPORTED,
                 [NSString stringWithFormat:@"%@ cannot capture %ux%u at %u fps",
-                                           _device.localizedName, _width, _height, _fps]);
+                                           _device.localizedName, parameters.width,
+                                           parameters.height, parameters.fps]);
   }
 
-  NSError *error = nil;
-  if (![_device lockForConfiguration:&error]) {
-    return fail(SCWC_MAC_ERR_OS, [NSString stringWithFormat:@"cannot configure %@: %@",
-                                                            _device.localizedName,
-                                                            error.localizedDescription]);
-  }
-  // AVFoundation raises rather than returns an error for a format or duration it rejects.
-  @try {
-    [_device setActiveFormat:format];
-    CMTime duration = frame_duration(format, _fps);
-    [_device setActiveVideoMinFrameDuration:duration];
-    [_device setActiveVideoMaxFrameDuration:duration];
-  } @catch (NSException *exception) {
-    [_device unlockForConfiguration];
-    return fail(SCWC_MAC_ERR_UNSUPPORTED,
-                [NSString stringWithFormat:@"%@ rejected %ux%u at %u fps: %@",
-                                           _device.localizedName, _width, _height, _fps,
-                                           exception.reason]);
-  }
-  [_device unlockForConfiguration];
-  _format = format;
-
-  _session = [[AVCaptureSession alloc] init];
+  AVCaptureSession *session = [[AVCaptureSession alloc] init];
 
 #if TARGET_OS_IPHONE
   // Without this preset, adding the input lets the session configure the device to suit its
   // own default preset, which would throw away the format and frame rate chosen above. The
   // input-priority preset says the input dictates the format instead; it does not exist on
   // macOS, where the session adopts the active format on its own, so macOS is left alone.
-  if ([_session canSetSessionPreset:AVCaptureSessionPresetInputPriority]) {
-    [_session setSessionPreset:AVCaptureSessionPresetInputPriority];
+  if ([session canSetSessionPreset:AVCaptureSessionPresetInputPriority]) {
+    [session setSessionPreset:AVCaptureSessionPresetInputPriority];
   } else {
     NSLog(@"[scwc-capture] the capture session refused the input-priority preset; it may "
            "override the selected format");
   }
 #endif
 
+  NSError *error = nil;
   AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:_device error:&error];
   if (input == nil) {
     return fail(SCWC_MAC_ERR_UNSUPPORTED, [NSString stringWithFormat:@"cannot capture from %@: %@",
                                                                     _device.localizedName,
                                                                     error.localizedDescription]);
   }
-  if (![_session canAddInput:input]) {
+  if (![session canAddInput:input]) {
     return fail(SCWC_MAC_ERR_UNSUPPORTED, @"the capture session refused the device input");
   }
-  [_session addInput:input];
+  [session addInput:input];
 
   AVCaptureVideoDataOutput *output = [[AVCaptureVideoDataOutput alloc] init];
   // Late frames are dropped by the session rather than queued; the encoder is the throttle.
@@ -932,64 +1292,68 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
     (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
   }];
   [output setSampleBufferDelegate:self queue:_delegateQueue];
-  if (![_session canAddOutput:output]) {
+  if (![session canAddOutput:output]) {
     return fail(SCWC_MAC_ERR_UNSUPPORTED, @"the capture session refused the video output");
   }
-  [_session addOutput:output];
-  _output = output;
+  [session addOutput:output];
 
-  int32_t code = [self createEncoder];
+  VTCompressionSessionRef encoder = NULL;
+  int32_t code = [self createEncoderWithParameters:parameters encoder:&encoder];
   if (code != SCWC_MAC_OK) {
     return code;
   }
 
-  // Before the session runs, so an interruption during startup is not missed.
-  [self subscribeNotifications];
-
-  @try {
-    [_session startRunning];
-  } @catch (NSException *exception) {
-    return fail(SCWC_MAC_ERR_OS, [NSString stringWithFormat:@"capture session failed to start: %@",
-                                                            exception.reason]);
-  }
-  if (![_session isRunning]) {
-    return fail(SCWC_MAC_ERR_OS, [NSString stringWithFormat:@"capture session did not start for %@",
-                                                            _device.localizedName]);
-  }
+  *outFormat = format;
+  *outSession = session;
+  *outOutput = output;
+  *outEncoder = encoder;
   return SCWC_MAC_OK;
 }
 
-/// Creates the VideoToolbox encoder for the current parameters.
-- (int32_t)createEncoder {
-  CMVideoCodecType codec = _codec == 1 ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264;
-  OSStatus status = VTCompressionSessionCreate(kCFAllocatorDefault, (int32_t)_width,
-                                                (int32_t)_height, codec, NULL, NULL,
+/// Creates the VideoToolbox encoder for `parameters`; the caller owns the encoder.
+- (int32_t)createEncoderWithParameters:(const CaptureParameters &)parameters
+                               encoder:(VTCompressionSessionRef *)outEncoder {
+  CMVideoCodecType codec = parameters.codec == 1 ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264;
+  VTCompressionSessionRef encoder = NULL;
+  OSStatus status = VTCompressionSessionCreate(kCFAllocatorDefault, (int32_t)parameters.width,
+                                                (int32_t)parameters.height, codec, NULL, NULL,
                                                 kCFAllocatorDefault, vt_output_callback,
-                                                (__bridge void *)self, &_encoder);
-  if (status != noErr || _encoder == NULL) {
+                                                (__bridge void *)self, &encoder);
+  if (status != noErr || encoder == NULL) {
+    // Nothing else can reach a session the call reported a failure for, so it goes here.
+    if (encoder != NULL) {
+      CFRelease(encoder);
+    }
     return fail(SCWC_MAC_ERR_OS, [NSString stringWithFormat:@"VideoToolbox refused %ux%u (%d)",
-                                                            _width, _height, (int)status]);
+                                                            parameters.width, parameters.height,
+                                                            (int)status]);
   }
 
-  set_property(_encoder, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
+  set_property(encoder, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
   // A GOP of two seconds bounds how long a late joiner waits for a keyframe.
-  set_property(_encoder, kVTCompressionPropertyKey_MaxKeyFrameInterval,
-               (__bridge CFTypeRef)@(2 * _fps));
-  set_property(_encoder, kVTCompressionPropertyKey_AverageBitRate,
-               (__bridge CFTypeRef)@(_bitrateKbps * 1000u));
-  set_property(_encoder, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFTypeRef)@(_fps));
+  set_property(encoder, kVTCompressionPropertyKey_MaxKeyFrameInterval,
+               (__bridge CFTypeRef)@(2 * parameters.fps));
+  set_property(encoder, kVTCompressionPropertyKey_AverageBitRate,
+               (__bridge CFTypeRef)@(parameters.bitrate_kbps * 1000u));
+  set_property(encoder, kVTCompressionPropertyKey_ExpectedFrameRate,
+               (__bridge CFTypeRef)@(parameters.fps));
   // No B-frames: reordering would buy little bandwidth and cost latency.
-  set_property(_encoder, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
-  set_property(_encoder, kVTCompressionPropertyKey_ProfileLevel,
-               _codec == 1 ? kVTProfileLevel_HEVC_Main_AutoLevel
-                           : kVTProfileLevel_H264_High_AutoLevel);
+  set_property(encoder, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+  set_property(encoder, kVTCompressionPropertyKey_ProfileLevel,
+               parameters.codec == 1 ? kVTProfileLevel_HEVC_Main_AutoLevel
+                                     : kVTProfileLevel_H264_High_AutoLevel);
 
-  status = VTCompressionSessionPrepareToEncodeFrames(_encoder);
+  status = VTCompressionSessionPrepareToEncodeFrames(encoder);
   if (status != noErr) {
+    // The caller never sees this one, so it is invalidated and released here.
+    VTCompressionSessionInvalidate(encoder);
+    CFRelease(encoder);
     return fail(SCWC_MAC_ERR_OS,
                 [NSString stringWithFormat:@"VideoToolbox could not prepare the encoder (%d)",
                                            (int)status]);
   }
+
+  *outEncoder = encoder;
   return SCWC_MAC_OK;
 }
 
@@ -1021,6 +1385,10 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
     _latestPixelBuffer = pixel_buffer;
   }
 
+  // The preview is fed from the same frame the encoder gets, so the picture the operator sees
+  // is the one being recorded. It does nothing at all while no preview is wanted.
+  [self publishPreview:pixel_buffer];
+
   VTCompressionSessionRef encoder = _encoder;
   if (encoder == NULL) {
     return;
@@ -1029,7 +1397,8 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
   OSStatus status = VTCompressionSessionEncodeFrame(encoder, pixel_buffer, pts, kCMTimeInvalid,
                                                      NULL, NULL, NULL);
   if (status != noErr) {
-    NSLog(@"[scwc-capture] encoding a frame failed: %d", (int)status);
+    // A frame the encoder refuses is the first sign of a pipeline that has stopped encoding.
+    [self reportFailure:[NSString stringWithFormat:@"encoding a frame failed: %d", (int)status]];
   }
 }
 
@@ -1041,7 +1410,9 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
     return;
   }
   if (status != noErr || sample == NULL) {
-    NSLog(@"[scwc-capture] the encoder reported status %d", (int)status);
+    // The lock is already held: this is the fail path of a frame the encoder gave up on.
+    [self reportFailureLocked:[NSString stringWithFormat:@"the encoder reported status %d",
+                                                         (int)status]];
     return;
   }
   if (!CMSampleBufferDataIsReady(sample)) {
@@ -1183,6 +1554,19 @@ extern "C" int32_t scwc_mac_set_status_cb(void *handle, scwc_mac_status_cb cb, v
   return SCWC_MAC_OK;
 }
 
+extern "C" int32_t scwc_mac_set_preview_cb(void *handle, scwc_mac_preview_cb cb, void *user,
+                                           scwc_mac_preview_wanted_cb wanted) {
+  if (handle == NULL) {
+    return fail(SCWC_MAC_ERR_OS, @"preview callback set without a handle");
+  }
+  if (cb != NULL && wanted == NULL) {
+    return fail(SCWC_MAC_ERR_OS, @"preview callback set without a gate");
+  }
+  ScwcMacCapture *capture = (__bridge ScwcMacCapture *)handle;
+  [capture setPreviewCallback:cb user:user wanted:wanted];
+  return SCWC_MAC_OK;
+}
+
 extern "C" int32_t scwc_mac_set_params(void *handle, uint32_t width, uint32_t height, uint32_t fps,
                                        int32_t codec, uint32_t bitrate_kbps) {
   if (handle == NULL) {
@@ -1208,9 +1592,10 @@ extern "C" void scwc_mac_close(void *handle) {
   }
   @autoreleasepool {
     ScwcMacCapture *capture = (__bridge_transfer ScwcMacCapture *)handle;
-    // The status callback outlives a reconfigure, so it is dropped here explicitly: after
-    // this returns, no callback of any kind can reach Rust.
+    // The status and preview callbacks outlive a reconfigure, so they are dropped here
+    // explicitly: after this returns, no callback of any kind can reach Rust.
     [capture setStatusCallback:NULL user:NULL];
+    [capture setPreviewCallback:NULL user:NULL wanted:NULL];
     [capture shutdown];
   }
 }

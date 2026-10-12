@@ -4,9 +4,10 @@
  * Every function is called from the thread that owns the `CaptureSource`; the shim owns its
  * own capture and encoder threads and serializes them against these calls with locks. The
  * callbacks are invoked on those threads, except the status callback, which runs on whichever
- * thread the platform posted its notification from. On failure, a function returns a non-zero
- * code and leaves a human-readable message in the calling thread's slot, which
- * `scwc_mac_last_error` copies out.
+ * thread reported the change: the one that posted the platform's notification, the delegate
+ * queue of a frame the encoder refused, or a VideoToolbox thread. On failure, a function
+ * returns a non-zero code and leaves a human-readable message in the calling thread's slot,
+ * which `scwc_mac_last_error` copies out.
  */
 #ifndef SCWC_MAC_SHIM_H
 #define SCWC_MAC_SHIM_H
@@ -46,11 +47,32 @@ typedef void (*scwc_mac_frame_cb)(void *user, const uint8_t *data, size_t len,
 /* One JPEG still; fired at most once per `scwc_mac_take_photo` call. */
 typedef void (*scwc_mac_jpeg_cb)(void *user, const uint8_t *data, size_t len);
 
-/* Device status change; `state` is a thermal state, 0 nominal to 3 critical.
+/* One live preview frame, tightly packed BGRA (blue, green, red, alpha, one byte each, no row
+ * padding): `width * height` pixels at `data`, `len` bytes long. Fired for every captured frame
+ * while a preview callback is registered and its gate says the frame is wanted. The callback is
+ * expected to copy what it needs before returning: the buffer belongs to the shim. */
+typedef void (*scwc_mac_preview_cb)(void *user, const uint8_t *data, size_t len, uint32_t width,
+                                    uint32_t height);
+
+/* Whether preview frames are wanted right now: non-zero means yes.
  *
- * iOS only: the shim subscribes to `NSProcessInfoThermalStateDidChangeNotification` there,
- * and never calls this on macOS, where this backend reports no status. */
+ * Consulted before a frame is converted, which is what keeps a preview nobody is watching from
+ * costing a colour conversion per frame. It is called on the capture's own queue and must
+ * return promptly. */
+typedef int32_t (*scwc_mac_preview_wanted_cb)(void *user);
+
+/* Device status change; `state` is a thermal state — 0 nominal, 1 fair, 2 serious, 3 critical
+ * — or SCWC_MAC_STATUS_FAILURE, which reports that the pipeline hit a hard failure and that
+ * capture has probably stopped. Thermal states are iOS-only: the shim subscribes to
+ * `NSProcessInfoThermalStateDidChangeNotification` there. */
 typedef void (*scwc_mac_status_cb)(void *user, int32_t state);
+
+/* The status a pipeline reports once when it fails: an encoder that stopped encoding, a
+ * session that died at runtime. The platform's own description of the failure is written to
+ * the platform log by the shim, next to this report. */
+enum {
+  SCWC_MAC_STATUS_FAILURE = -1,
+};
 
 /* Start of one camera in the enumeration stream. */
 typedef void (*scwc_mac_camera_begin_cb)(void *user, const char *id, const char *name);
@@ -70,7 +92,14 @@ int32_t scwc_mac_open(const scwc_mac_config *cfg, scwc_mac_frame_cb frame_cb, vo
  * stays registered until it is replaced, so a `scwc_mac_set_params` reconfigure keeps it. */
 int32_t scwc_mac_set_status_cb(void *handle, scwc_mac_status_cb cb, void *user);
 
-/* Rebuilds the session and the encoder for new parameters. */
+/* Registers the preview callback and its gate, or unregisters both when `cb` is NULL. Like the
+ * status callback, it survives a `scwc_mac_set_params` reconfigure: a parameter switch is not a
+ * reason to re-register the preview. */
+int32_t scwc_mac_set_preview_cb(void *handle, scwc_mac_preview_cb cb, void *user,
+                                scwc_mac_preview_wanted_cb wanted);
+
+/* Rebuilds the session and the encoder for new parameters. A failure leaves the pipeline that
+ * is running — and the frames it delivers — in place, on the parameters it already had. */
 int32_t scwc_mac_set_params(void *handle, uint32_t width, uint32_t height, uint32_t fps,
                             int32_t codec, uint32_t bitrate_kbps);
 

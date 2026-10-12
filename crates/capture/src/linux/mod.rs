@@ -365,6 +365,8 @@ struct Capture {
     compressed: Vec<u8>,
     /// Reused staging for decoding and colour conversion on the photo path.
     rgb: Vec<u8>,
+    /// Reused staging for the frames the live preview gets.
+    bgra: Vec<u8>,
     /// Reused JPEG output of the photo path.
     jpeg: Vec<u8>,
     /// Reused Annex B output of the encoder.
@@ -415,6 +417,7 @@ impl Capture {
             frame,
             compressed: Vec::new(),
             rgb: Vec::new(),
+            bgra: Vec::new(),
             jpeg: Vec::new(),
             encoded: Vec::new(),
             photo_valid: false,
@@ -545,6 +548,9 @@ impl Capture {
         }
 
         self.photo_valid = true;
+        // The preview comes from the same NV12 frame the encoder is handed, so what the
+        // interface shows is what is being recorded.
+        self.publish_preview(width, height);
         self.encoded.clear();
         let keyframe = self.encoder.encode(&self.frame, &mut self.encoded)?;
 
@@ -559,6 +565,20 @@ impl Capture {
             );
         }
         Ok(())
+    }
+
+    /// Offers the frame the encoder is about to be given to the live preview.
+    ///
+    /// Nothing is converted while no preview is wanted: the conversion is a whole-frame pass,
+    /// and the preview sink is what decides whether it is worth it.
+    fn publish_preview(&mut self, width: usize, height: usize) {
+        if !scwc_core::preview::preview_enabled() {
+            return;
+        }
+        match convert::bgra_from_nv12(&self.frame, width, width, height, &mut self.bgra) {
+            Ok(()) => scwc_core::preview::publish_bgra(&self.bgra, width as u32, height as u32),
+            Err(error) => tracing::warn!(%error, "could not build the preview frame"),
+        }
     }
 
     /// Encodes the newest frame as JPEG and delivers it through the caller's callback.

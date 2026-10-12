@@ -60,6 +60,15 @@ buffers with timestamps — while the protocol, networking and framing logic liv
   flutter_rust_bridge v2 (async events over FRB streams / Dart_PostCObject). All dependencies
   are pure Rust + rustls, so static linking carries no GPL or dynamic-runtime baggage; the
   openh264 dependency is M1-only and must not leak into the production core.
+- **Parameter switching semantics**: the capture pipeline answers a parameter switch
+  (resolution/fps/codec/bitrate from the server) differently by state. **Standby** (no active
+  stream): apply immediately — a no-op comparison skips the rebuild when nothing actually
+  changed, and a real change goes through build-then-swap so a failed rebuild keeps the old
+  pipeline alive. **Recording**: the command is cached latest-wins (each new command replaces
+  the pending one unapplied); when the recording ends, only that final pending set is applied,
+  once. The last successfully applied parameter set is **persisted to disk** and takes
+  precedence over the server-announced defaults the next time the agent or a session opens, so
+  a deliberate switch survives restarts instead of being reset to defaults.
 
 ### Still open
 

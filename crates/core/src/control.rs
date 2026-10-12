@@ -10,15 +10,19 @@ use scwc_protocol::{
     TakePhotoPayload, encode_frame,
 };
 use serde_json::json;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::clock::now_rfc3339_nano;
+use crate::command::SwitchParams;
+use crate::events::{CoreEvent, Emit};
 use crate::media::{
-    self, DropStats, FrameSource, MediaFrame, StreamSpec, default_bitrate_kbps,
+    self, DropStats, FrameSource, MediaFrame, StreamSpec, codec_name, default_bitrate_kbps,
 };
+use crate::params::{ParamStore, PersistedParams};
 
 /// How long a stopped capture task may take to wind down before it is aborted.
 const CAPTURE_STOP_TIMEOUT: Duration = Duration::from_secs(1);
@@ -32,6 +36,17 @@ struct CameraParameters {
     codec: Codec,
 }
 
+/// A parameter switch that arrived while a stream was running.
+///
+/// Only the latest command survives: it is applied once, after that stream is gone, so a
+/// recording never changes resolution under the server's feet.
+struct PendingSwitch {
+    /// Camera the switch names; the camera the deferred set belongs to.
+    camera_enum: u32,
+    /// The set the source is reconfigured with when the stream ends.
+    params: PersistedParams,
+}
+
 /// A stream the core is currently feeding.
 struct ActiveStream {
     camera_enum: u32,
@@ -39,6 +54,19 @@ struct ActiveStream {
     started: Instant,
     stop: watch::Sender<bool>,
     task: JoinHandle<()>,
+}
+
+impl Drop for ActiveStream {
+    /// Aborts the capture task the session was running.
+    ///
+    /// [`ControlState::stop_active`] is how a stream ends normally, and it awaits the task
+    /// before this runs, so the abort here only ever matters when the session itself is gone —
+    /// a panic inside it. Then this is what stops the pipeline from pulling frames into a queue
+    /// nobody reads any more, and what releases the frame source it holds the moment the
+    /// session dies instead of at the next frame.
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 /// Per-session device state: the announced cameras, the active stream and the outbound
@@ -53,6 +81,9 @@ pub(crate) struct ControlState<F: FrameSource> {
     active_camera: Arc<AtomicU32>,
     active: Option<ActiveStream>,
     started: Instant,
+    events: Option<UnboundedSender<CoreEvent>>,
+    params: Arc<ParamStore>,
+    pending: Option<PendingSwitch>,
 }
 
 impl<F: FrameSource + 'static> ControlState<F> {
@@ -66,6 +97,8 @@ impl<F: FrameSource + 'static> ControlState<F> {
         media_tx: mpsc::Sender<MediaFrame>,
         stats: Arc<DropStats>,
         active_camera: Arc<AtomicU32>,
+        events: Option<UnboundedSender<CoreEvent>>,
+        params: Arc<ParamStore>,
     ) -> Self {
         let parameters = cameras
             .iter()
@@ -86,6 +119,9 @@ impl<F: FrameSource + 'static> ControlState<F> {
             active_camera,
             active: None,
             started: Instant::now(),
+            events,
+            params,
+            pending: None,
         }
     }
 
@@ -112,6 +148,14 @@ impl<F: FrameSource + 'static> ControlState<F> {
     /// Stream id the core may push frames for, if any.
     pub(crate) fn active_stream_id(&self) -> Option<&str> {
         self.active.as_ref().map(|active| active.stream_id.as_str())
+    }
+
+    /// Whether the pipeline is currently feeding a stream.
+    ///
+    /// A stream is what defers a parameter switch and holds a requested reconnect back, so the
+    /// session can tell when either has come due.
+    pub(crate) fn is_streaming(&self) -> bool {
+        self.active.is_some()
     }
 
     /// A server-agnostic state report, used for keepalives and the periodic drop report.
@@ -157,83 +201,109 @@ impl<F: FrameSource + 'static> ControlState<F> {
         self.stop_active().await;
     }
 
-    /// Handles `switch_camera`: validates the target against the announcement, reconfigures
-    /// the source and only then answers `ok`.
+    /// Handles `switch_camera`: moves the source onto the requested parameters.
+    ///
+    /// The command is only the server's way in; the request itself travels the one path a
+    /// switch takes, shared with the ones an embedding application asks for.
     async fn switch_camera(&mut self, envelope: &Envelope) {
         let payload: SwitchCameraPayload = match envelope.payload_as() {
             Ok(payload) => payload,
             Err(error) => {
-                self.ack(
+                self.reject(
                     envelope.id.as_deref(),
-                    Err(format!("invalid switch_camera payload: {error}")),
+                    format!("invalid switch_camera payload: {error}"),
                 );
                 return;
             }
         };
 
-        let index = payload.camera_enum as usize;
+        let result = self
+            .switch(SwitchParams {
+                camera_enum: payload.camera_enum,
+                resolution: payload.resolution,
+                fps: payload.fps,
+                // The protocol's `switch_camera` names no codec and no bitrate: the camera keeps
+                // the codec it runs, and the client derives the rate it can afford.
+                codec: None,
+                bitrate_kbps: None,
+            })
+            .await;
+        self.ack(envelope.id.as_deref(), result);
+    }
+
+    /// Validates a parameter switch against the announcement and routes it.
+    ///
+    /// The one path a switch travels, whoever asked for it: applied at once while no stream
+    /// runs, and remembered — latest wins — until the active one ends otherwise, so a recording
+    /// keeps the parameters it started with. An applied set is persisted, so the next session
+    /// opens with it. The caller decides how the outcome is reported: a server command through
+    /// its `ack`, an application request through the event hook.
+    pub(crate) async fn switch(&mut self, request: SwitchParams) -> Result<(), String> {
+        let index = request.camera_enum as usize;
         let Some(camera) = self.cameras.get(index) else {
-            self.ack(
-                envelope.id.as_deref(),
-                Err(format!("camera {} is not registered", payload.camera_enum)),
-            );
-            return;
+            return Err(format!("camera {} is not registered", request.camera_enum));
         };
 
-        let resolution = payload
+        let resolution = request
             .resolution
             .clone()
             .unwrap_or_else(|| camera.resolution.clone());
-        let fps = payload.fps.unwrap_or(camera.fps);
+        let fps = request.fps.unwrap_or(camera.fps);
         if !camera.supported_resolutions.contains(&resolution) {
-            self.ack(
-                envelope.id.as_deref(),
-                Err(format!(
-                    "resolution {resolution} is not announced for camera {}",
-                    payload.camera_enum
-                )),
-            );
-            return;
+            return Err(format!(
+                "resolution {resolution} is not announced for camera {}",
+                request.camera_enum
+            ));
         }
         if !camera.supported_framerates.contains(&fps) {
-            self.ack(
-                envelope.id.as_deref(),
-                Err(format!(
-                    "{fps} fps is not announced for camera {}",
-                    payload.camera_enum
-                )),
-            );
-            return;
+            return Err(format!(
+                "{fps} fps is not announced for camera {}",
+                request.camera_enum
+            ));
         }
 
-        let codec = self.parameters[index].codec;
-        let bitrate = default_bitrate_kbps(codec);
-        let result = {
-            let mut source = self.source.lock().await;
-            source
-                .set_parameters(&resolution, fps, codec, bitrate)
-                .map_err(|error| error.message().to_owned())
+        let codec = request.codec.unwrap_or(self.parameters[index].codec);
+        let bitrate_kbps = request
+            .bitrate_kbps
+            .unwrap_or_else(|| default_bitrate_kbps(codec, &resolution, fps));
+        let params = PersistedParams {
+            resolution: resolution.clone(),
+            fps,
+            codec,
+            bitrate_kbps,
         };
 
-        match result {
-            Ok(()) => {
-                self.parameters[index] = CameraParameters {
-                    resolution: resolution.clone(),
-                    fps,
-                    codec,
-                };
-                self.active_camera.store(payload.camera_enum, Ordering::Relaxed);
-                info!(
-                    camera_enum = payload.camera_enum,
-                    resolution = %resolution,
-                    fps,
-                    ?codec,
-                    "camera switched"
-                );
-                self.ack(envelope.id.as_deref(), Ok(()));
-            }
-            Err(error) => self.ack(envelope.id.as_deref(), Err(error)),
+        if self.active.is_some() {
+            info!(
+                camera_enum = request.camera_enum,
+                resolution = %resolution,
+                fps,
+                ?codec,
+                bitrate_kbps,
+                "a stream is live; applying the parameter switch when it ends"
+            );
+            self.events.emit(CoreEvent::Notice {
+                message: format!(
+                    "the parameter switch to {} waits for the end of the recording",
+                    describe(&params)
+                ),
+            });
+            self.pending = Some(PendingSwitch {
+                camera_enum: request.camera_enum,
+                params,
+            });
+            return Ok(());
         }
+
+        info!(
+            camera_enum = request.camera_enum,
+            resolution = %resolution,
+            fps,
+            ?codec,
+            bitrate_kbps,
+            "camera switched"
+        );
+        self.apply(request.camera_enum, &params).await
     }
 
     /// Handles `start_recording`: takes over the single capture pipeline and starts feeding
@@ -242,9 +312,9 @@ impl<F: FrameSource + 'static> ControlState<F> {
         let payload: StartRecordingPayload = match envelope.payload_as() {
             Ok(payload) => payload,
             Err(error) => {
-                self.ack(
+                self.reject(
                     envelope.id.as_deref(),
-                    Err(format!("invalid start_recording payload: {error}")),
+                    format!("invalid start_recording payload: {error}"),
                 );
                 return;
             }
@@ -278,20 +348,18 @@ impl<F: FrameSource + 'static> ControlState<F> {
         if let Some(codec) = payload.codec {
             let parameters = self.parameters[index].clone();
             if codec != parameters.codec {
-                let bitrate = default_bitrate_kbps(codec);
-                let result = {
-                    let mut source = self.source.lock().await;
-                    source
-                        .set_parameters(&parameters.resolution, parameters.fps, codec, bitrate)
-                        .map_err(|error| error.message().to_owned())
+                let bitrate =
+                    default_bitrate_kbps(codec, &parameters.resolution, parameters.fps);
+                let params = PersistedParams {
+                    resolution: parameters.resolution,
+                    fps: parameters.fps,
+                    codec,
+                    bitrate_kbps: bitrate,
                 };
-                match result {
-                    Ok(()) => self.parameters[index].codec = codec,
-                    Err(error) => {
-                        warn!(%error, "could not apply the requested codec");
-                        self.ack(id.as_deref(), Err(error));
-                        return;
-                    }
+                if let Err(error) = self.apply(payload.camera_enum, &params).await {
+                    warn!(%error, "could not apply the requested codec");
+                    self.ack(id.as_deref(), Err(error));
+                    return;
                 }
             }
         }
@@ -442,7 +510,88 @@ impl<F: FrameSource + 'static> ControlState<F> {
         }
     }
 
+    /// Answers a command that could not even be decoded.
+    ///
+    /// The server learns about it from the `ack`, the caller from the event hook.
+    fn reject(&self, id: Option<&str>, message: String) {
+        self.events.emit(CoreEvent::Warn {
+            message: message.clone(),
+        });
+        self.ack(id, Err(message));
+    }
+
+    /// Moves the source onto `params`, remembers the set and persists it.
+    ///
+    /// The source skips a request that matches what it already runs, so calling this with
+    /// the parameters the pipeline is on costs nothing. On failure the source and the
+    /// server's view of the camera are left unchanged and the reason is returned.
+    async fn apply(&mut self, camera_enum: u32, params: &PersistedParams) -> Result<(), String> {
+        let result = {
+            let mut source = self.source.lock().await;
+            source
+                .set_parameters(
+                    &params.resolution,
+                    params.fps,
+                    params.codec,
+                    params.bitrate_kbps,
+                )
+                .map_err(|error| error.message().to_owned())
+        };
+
+        if let Err(error) = result {
+            self.events.emit(CoreEvent::Warn {
+                message: format!("could not apply the requested capture parameters: {error}"),
+            });
+            return Err(error);
+        }
+
+        self.parameters[camera_enum as usize] = CameraParameters {
+            resolution: params.resolution.clone(),
+            fps: params.fps,
+            codec: params.codec,
+        };
+        self.active_camera.store(camera_enum, Ordering::Relaxed);
+        self.events.emit(CoreEvent::ParametersApplied {
+            camera_enum,
+            resolution: params.resolution.clone(),
+            fps: params.fps,
+            codec: codec_name(params.codec).to_owned(),
+            bitrate_kbps: params.bitrate_kbps,
+        });
+        // The switch is deliberate, so the next session has to start from it instead of
+        // from the parameters the registration announces.
+        self.params.record_applied(params);
+        Ok(())
+    }
+
+    /// Applies the parameter set a command deferred while a stream was running.
+    ///
+    /// The deferred command was acknowledged when it arrived; only the set has to follow,
+    /// once, now that the pipeline is free.
+    async fn apply_pending(&mut self) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+
+        info!(
+            camera_enum = pending.camera_enum,
+            resolution = %pending.params.resolution,
+            fps = pending.params.fps,
+            codec = ?pending.params.codec,
+            "applying the parameter switch deferred while streaming"
+        );
+        if let Err(error) = self.apply(pending.camera_enum, &pending.params).await {
+            warn!(%error, "could not apply the parameters deferred while streaming");
+        }
+    }
+
     /// Signals the capture task, waits briefly for it and aborts it if it does not wind down.
+    ///
+    /// Every stream teardown goes through here — an explicit `stop_recording`, a stream
+    /// replaced by `start_recording` and the end of the session — so this is also where a
+    /// parameter switch deferred during the stream is applied. A session that dies while
+    /// recording therefore switches the pipeline as part of its own teardown, before the
+    /// next session starts from the persisted set anyway.
     async fn stop_active(&mut self) {
         let Some(mut active) = self.active.take() else {
             return;
@@ -459,6 +608,8 @@ impl<F: FrameSource + 'static> ControlState<F> {
                 active.task.abort();
             }
         }
+
+        self.apply_pending().await;
     }
 }
 
@@ -517,6 +668,17 @@ async fn capture_photo<F: FrameSource + 'static>(
     }
 }
 
+/// Renders a parameter set for a message a user reads.
+fn describe(params: &PersistedParams) -> String {
+    format!(
+        "{} at {} fps, {}, {} kbps",
+        params.resolution,
+        params.fps,
+        codec_name(params.codec),
+        params.bitrate_kbps
+    )
+}
+
 /// Reports a problem the server cannot learn from an `ack`, correlated to a command when
 /// one is known.
 fn send_error(out: &mpsc::UnboundedSender<Message>, id: Option<String>, message: String) {
@@ -536,5 +698,181 @@ fn send_error(out: &mpsc::UnboundedSender<Message>, id: Option<String>, message:
             }
         }
         Err(error) => warn!(%error, "could not serialize an error report"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    use scwc_protocol::{
+        AckPayload, CameraRegistration, Codec, Envelope, StartRecordingPayload,
+        StopRecordingPayload, SwitchCameraPayload,
+    };
+    use tokio::sync::{Mutex, mpsc};
+    use tokio_tungstenite::tungstenite::Message;
+
+    use super::ControlState;
+    use crate::events::CoreEvent;
+    use crate::media::test_support::{Applied, RecordingSource, TempDir};
+    use crate::media::{DropStats, MEDIA_QUEUE_CAPACITY, MediaFrame};
+    use crate::params::ParamStore;
+
+    /// One camera, announced at 1920x1080@30 in H.264.
+    fn cameras() -> Vec<CameraRegistration> {
+        vec![CameraRegistration {
+            camera_enum: 0,
+            resolution: "1920x1080".to_owned(),
+            fps: 30,
+            supported_resolutions: vec!["1920x1080".to_owned(), "1280x720".to_owned()],
+            supported_framerates: vec![30, 15],
+            supported_codec: vec![Codec::H264, Codec::H265],
+            attrs: Default::default(),
+        }]
+    }
+
+    fn switch_camera(resolution: &str, fps: u32) -> Envelope {
+        Envelope::typed(
+            "switch_camera",
+            &SwitchCameraPayload {
+                camera_enum: 0,
+                resolution: Some(resolution.to_owned()),
+                fps: Some(fps),
+            },
+        )
+        .expect("a switch_camera envelope")
+        .with_id("switch")
+    }
+
+    fn start_recording(stream_id: &str) -> Envelope {
+        Envelope::typed(
+            "start_recording",
+            &StartRecordingPayload {
+                camera_enum: 0,
+                stream_id: stream_id.to_owned(),
+                codec: None,
+            },
+        )
+        .expect("a start_recording envelope")
+        .with_id("start")
+    }
+
+    fn stop_recording(stream_id: &str) -> Envelope {
+        Envelope::typed(
+            "stop_recording",
+            &StopRecordingPayload {
+                camera_enum: 0,
+                stream_id: stream_id.to_owned(),
+            },
+        )
+        .expect("a stop_recording envelope")
+        .with_id("stop")
+    }
+
+    /// A control state over a [`RecordingSource`], with every queue it writes to kept open.
+    struct Harness {
+        control: ControlState<RecordingSource>,
+        applied: Arc<StdMutex<Vec<Applied>>>,
+        acks: mpsc::UnboundedReceiver<Message>,
+        _media: mpsc::Receiver<MediaFrame>,
+        _events: mpsc::UnboundedReceiver<CoreEvent>,
+    }
+
+    impl Harness {
+        fn new(state_path: Option<PathBuf>) -> Self {
+            let (source, applied) = RecordingSource::new(Codec::H264);
+            let (control_tx, acks) = mpsc::unbounded_channel();
+            let (media_tx, media) = mpsc::channel(MEDIA_QUEUE_CAPACITY);
+            let (events_tx, events) = mpsc::unbounded_channel();
+            let control = ControlState::new(
+                Arc::new(Mutex::new(source)),
+                cameras(),
+                Codec::H264,
+                control_tx,
+                media_tx,
+                Arc::new(DropStats::default()),
+                Arc::new(AtomicU32::new(0)),
+                Some(events_tx),
+                Arc::new(ParamStore::new(state_path, None)),
+            );
+
+            Self {
+                control,
+                applied,
+                acks,
+                _media: media,
+                _events: events,
+            }
+        }
+
+        /// The reconfigurations that reached the source, in order.
+        fn applied(&self) -> Vec<Applied> {
+            self.applied
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        }
+
+        /// The `ack` payloads queued so far, in order.
+        fn acks(&mut self) -> Vec<AckPayload> {
+            let mut acks = Vec::new();
+            while let Ok(message) = self.acks.try_recv() {
+                let text = message.to_text().expect("an ack is text");
+                let envelope: Envelope = serde_json::from_str(text).expect("a control envelope");
+                acks.push(envelope.payload_as::<AckPayload>().expect("an ack payload"));
+            }
+
+            acks
+        }
+    }
+
+    #[tokio::test]
+    async fn a_switch_without_a_stream_reaches_the_pipeline_and_the_state_file_at_once() {
+        let dir = TempDir::new("idle-switch");
+        let path = dir.path().join("capture-params.json");
+        let mut harness = Harness::new(Some(path.clone()));
+
+        harness.control.handle(switch_camera("1280x720", 15)).await;
+
+        assert_eq!(
+            harness.applied(),
+            vec![Applied {
+                resolution: "1280x720".to_owned(),
+                fps: 15,
+                codec: Codec::H264,
+                // 1280x720 at 15 fps is 13.8 megapixels per second at H.264's budget.
+                bitrate_kbps: 1_480,
+            }]
+        );
+        assert_eq!(harness.acks(), vec![AckPayload::ok()]);
+
+        let persisted = ParamStore::new(Some(path), None)
+            .persisted()
+            .expect("the applied set is persisted");
+        assert_eq!(persisted.resolution, "1280x720");
+        assert_eq!(persisted.fps, 15);
+    }
+
+    #[tokio::test]
+    async fn switching_while_recording_defers_only_the_latest_set_to_the_end() {
+        let mut harness = Harness::new(None);
+
+        harness.control.handle(start_recording("stream-1")).await;
+        harness.control.handle(switch_camera("1280x720", 15)).await;
+        harness.control.handle(switch_camera("1920x1080", 15)).await;
+        assert!(
+            harness.applied().is_empty(),
+            "a live stream keeps the parameters it started with"
+        );
+
+        harness.control.handle(stop_recording("stream-1")).await;
+
+        let applied = harness.applied();
+        assert_eq!(applied.len(), 1, "the deferred set is applied exactly once");
+        assert_eq!(applied[0].resolution, "1920x1080");
+        assert_eq!(applied[0].fps, 15);
+        assert_eq!(harness.acks(), vec![AckPayload::ok(); 4]);
     }
 }

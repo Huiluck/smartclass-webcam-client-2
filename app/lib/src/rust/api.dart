@@ -8,9 +8,9 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'api.freezed.dart';
 
-// These functions are ignored because they are not marked as `pub`: `capabilities`, `emit`, `parse_codec`, `report_stats`, `runtime`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AgentSlot`, `CountingSource`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `fmt`, `fmt`, `fmt`, `next_frame`, `preferred_codec`, `set_parameters`, `take_photo`
+// These functions are ignored because they are not marked as `pub`: `capabilities`, `config_dir`, `emit_preview`, `emit`, `forward_core_events`, `forward_preview_frames`, `init_logging`, `into_core`, `log_file_path`, `open_camera`, `parse_codec`, `read_server_config`, `report_stats`, `retry_after`, `runtime`, `send_command`, `server_config_path`, `state_path`, `write_server_config`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AgentSlot`, `CountingSource`, `MessageVisitor`, `WarnLayer`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `next_frame`, `on_event`, `preferred_codec`, `record_debug`, `record_str`, `set_parameters`, `take_photo`
 
 /// Lists the cameras of the host.
 ///
@@ -23,21 +23,86 @@ List<CameraInfoDto> listCameras() => RustLib.instance.api.crateApiListCameras();
 /// Returns as soon as the agent is scheduled. Fails when an agent already runs, or when the
 /// configuration can never work: an empty device id or token, an unparsable server URL, an
 /// unsupported codec name, or no camera at all. Everything that can fail later — the camera not
-/// opening, the server rejecting the token — arrives as [`AgentEvent::Error`].
+/// opening, the server rejecting the token — arrives as an [`AgentEvent`] the agent retries
+/// through, and the client only stops when [`stop_agent`] asks it to.
 Future<void> startAgent({required AgentConfig config}) =>
     RustLib.instance.api.crateApiStartAgent(config: config);
 
 /// Stops the background agent, if one runs.
 ///
 /// Returns without waiting: the loop notices the signal at its next await point, and a later
-/// [`start_agent`] waits for it to wind down before touching the camera again.
+/// [`start_agent`] waits for it to wind down before touching the camera again. It also ends the
+/// camera retries and any wait for the server, so nothing brings a stopped agent back.
 Future<void> stopAgent() => RustLib.instance.api.crateApiStopAgent();
+
+/// Moves the running agent's capture pipeline onto new parameters.
+///
+/// The switch travels the same path a `switch_camera` command from the server does: applied at
+/// once while no stream is live, and once the active stream ends otherwise, the last request
+/// winning. An empty `bitrate_kbps` — a bitrate field the operator left alone — lets the client
+/// derive one from the codec, the resolution and the frame rate. Fails when no agent runs, and
+/// when the codec is not one this client encodes.
+void applyCaptureParams({
+  required String resolution,
+  required int fps,
+  required String codec,
+  int? bitrateKbps,
+}) => RustLib.instance.api.crateApiApplyCaptureParams(
+  resolution: resolution,
+  fps: fps,
+  codec: codec,
+  bitrateKbps: bitrateKbps,
+);
+
+/// Stores the server identity and asks a running agent to register again with it.
+///
+/// The identity lives in `<config dir>/sc-webcam/server.json`, next to the capture parameters the
+/// core persists, and is always written: an agent that is not running picks it up at its next
+/// [`start_agent`]. A running agent reconnects at the first opportunity — right away while no
+/// stream is live, and once the live one ends otherwise — so a recording is never cut short by a
+/// configuration change.
+void saveServerConfig({
+  required String server,
+  required String deviceId,
+  required String token,
+}) => RustLib.instance.api.crateApiSaveServerConfig(
+  server: server,
+  deviceId: deviceId,
+  token: token,
+);
+
+/// The server identity the client was last configured with.
+///
+/// `None` means there is none yet — a fresh install — or the stored one cannot be read. This is
+/// what lets a launch connect without a click: the UI fills its fields from it and starts the
+/// agent.
+ServerConfig? loadServerConfig() =>
+    RustLib.instance.api.crateApiLoadServerConfig();
 
 /// Subscribes to [`AgentEvent`]s; the returned Dart stream is the agent's progress.
 ///
 /// Only events emitted after the call are delivered, and a subscription that Dart cancelled is
 /// dropped at the next event.
 Stream<AgentEvent> agentEvents() => RustLib.instance.api.crateApiAgentEvents();
+
+/// Subscribes to live preview frames; the returned Dart stream is the camera picture.
+///
+/// Frames arrive only while an agent runs and a target size is set. Only frames captured after the
+/// call are delivered, one is dropped rather than queued while Dart is still decoding the previous
+/// one, and a subscription that Dart cancelled is dropped at the next frame.
+Stream<PreviewFrame> previewStream() =>
+    RustLib.instance.api.crateApiPreviewStream();
+
+/// Sets the size the preview frames are scaled to before they reach Dart.
+///
+/// The UI sends the pixel size of its preview area — the logical size of the area times the device
+/// pixel ratio — on every layout change, and `0x0` while it shows no preview. The capture path
+/// scales every frame aspect-locked to fit inside that box, so no letterboxing ever reaches the
+/// UI: it centres what it gets.
+void setPreviewTargetSize({required int width, required int height}) => RustLib
+    .instance
+    .api
+    .crateApiSetPreviewTargetSize(width: width, height: height);
 
 /// Everything the UI has to know to start the agent.
 class AgentConfig {
@@ -65,8 +130,9 @@ class AgentConfig {
   /// `h264` or `h265`, exactly as the protocol spells them.
   final String codec;
 
-  /// Encoder bitrate in kilobits per second.
-  final int bitrateKbps;
+  /// Encoder bitrate in kilobits per second; `None` derives one from the codec, the resolution
+  /// and the frame rate, which is what an empty bitrate field in the UI means.
+  final int? bitrateKbps;
 
   const AgentConfig({
     required this.server,
@@ -77,7 +143,7 @@ class AgentConfig {
     required this.height,
     required this.fps,
     required this.codec,
-    required this.bitrateKbps,
+    this.bitrateKbps,
   });
 
   @override
@@ -127,11 +193,42 @@ sealed class AgentEvent with _$AgentEvent {
   /// The server's stream ended.
   const factory AgentEvent.recordingStopped() = AgentEvent_RecordingStopped;
 
-  /// The connection died and the core is registering again.
+  /// The core lost its connection and is registering again.
   const factory AgentEvent.reconnecting({
-    /// Reconnect attempt, counting from one.
+    /// Reconnect attempts since the last attach that worked, counting from one.
     required int attempt,
   }) = AgentEvent_Reconnecting;
+
+  /// A failure the client survived; it keeps capturing.
+  const factory AgentEvent.warn({
+    /// Human-readable message.
+    required String message,
+  }) = AgentEvent_Warn;
+
+  /// The capture pipeline is now running this parameter set.
+  ///
+  /// Emitted for every switch and for the set a session opens with, so the UI can show what the
+  /// camera actually runs instead of what it asked for. The agent drives one camera, so the
+  /// set is not attributed.
+  const factory AgentEvent.parametersApplied({
+    /// Protocol resolution, for example `1920x1080`.
+    required String resolution,
+
+    /// Frame rate in frames per second.
+    required int fps,
+
+    /// Codec the frames are encoded with, spelled as the protocol spells it (`h264`).
+    required String codec,
+
+    /// Encoder bitrate in kilobits per second.
+    required int bitrateKbps,
+  }) = AgentEvent_ParametersApplied;
+
+  /// Something the client postponed or wants the operator to know that is not a failure.
+  const factory AgentEvent.notice({
+    /// Human-readable message.
+    required String message,
+  }) = AgentEvent_Notice;
 
   /// Frame counters, reported once a second while the agent runs.
   const factory AgentEvent.stats({
@@ -177,4 +274,67 @@ class CameraInfoDto {
           id == other.id &&
           name == other.name &&
           presets == other.presets;
+}
+
+/// One live preview frame of the camera, ready to be turned into a picture.
+///
+/// The capture path converts and scales on the Rust side, so the UI only has to wrap the pixels
+/// in an image and centre it inside its preview area.
+class PreviewFrame {
+  /// Row-major pixels without padding, four bytes each: red, green, blue, alpha.
+  final Uint8List rgba;
+
+  /// Frame width in pixels, after the scaling the UI asked for.
+  final int width;
+
+  /// Frame height in pixels, after the scaling the UI asked for.
+  final int height;
+
+  const PreviewFrame({
+    required this.rgba,
+    required this.width,
+    required this.height,
+  });
+
+  @override
+  int get hashCode => rgba.hashCode ^ width.hashCode ^ height.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is PreviewFrame &&
+          runtimeType == other.runtimeType &&
+          rgba == other.rgba &&
+          width == other.width &&
+          height == other.height;
+}
+
+/// The server identity the client registers with, as the UI shows and stores it.
+class ServerConfig {
+  /// Server base URL, for example `https://smartclass.example.edu`.
+  final String server;
+
+  /// Device id the token was issued for.
+  final String deviceId;
+
+  /// Device bearer token (`wdt_...`).
+  final String token;
+
+  const ServerConfig({
+    required this.server,
+    required this.deviceId,
+    required this.token,
+  });
+
+  @override
+  int get hashCode => server.hashCode ^ deviceId.hashCode ^ token.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ServerConfig &&
+          runtimeType == other.runtimeType &&
+          server == other.server &&
+          deviceId == other.deviceId &&
+          token == other.token;
 }

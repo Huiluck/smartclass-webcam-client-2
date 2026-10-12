@@ -1,4 +1,4 @@
-name: release
+name: Release
 
 # Packages the Flutter clients for every desktop platform plus an unsigned iOS
 # build, and publishes them as GitHub release assets. `v*` tags trigger it;
@@ -25,6 +25,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  FLUTTER_VERSION: '3.47.7'
 
 jobs:
   # Resolves the single tag this run builds, and makes sure it exists on the
@@ -71,14 +72,45 @@ jobs:
           ref: ${{ needs.resolve.outputs.tag }}
 
       - name: Install Rust (stable)
-        run: rustup toolchain install stable --profile minimal
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          if ("${{ matrix.arch }}" -eq "arm64") { rustup target add aarch64-pc-windows-msvc }
 
       - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
 
-      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+      # Flutter publishes no Windows/Linux ARM64 SDK archives, so flutter-action
+      # cannot resolve "architecture: arm64". Arm64 runners instead install the
+      # SDK from a pinned git tag (it bootstraps the matching Dart SDK and engine
+      # artifacts natively) and cache the whole SDK directory.
+      - name: Install Flutter (x64)
+        if: matrix.arch == 'x64'
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
+
+      - name: Cache Flutter SDK (arm64)
+        if: matrix.arch == 'arm64'
+        id: flutter-sdk-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: C:\flutter-sdk
+          key: flutter-sdk-${{ env.FLUTTER_VERSION }}-windows-arm64
+
+      - name: Install Flutter SDK (arm64, git clone)
+        if: matrix.arch == 'arm64' && steps.flutter-sdk-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: git clone --depth 1 --branch ${{ env.FLUTTER_VERSION }} https://github.com/flutter/flutter.git C:\flutter-sdk
+
+      - name: Bootstrap Flutter SDK (arm64)
+        if: matrix.arch == 'arm64'
+        shell: pwsh
+        run: |
+          # GITHUB_PATH only applies to later steps, so call flutter by path here.
+          echo "C:\flutter-sdk\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          C:\flutter-sdk\bin\flutter.bat --version
 
       # Flutter desktop apps cannot be cross-built, so each architecture is
       # built on a matching native runner.
@@ -99,6 +131,26 @@ jobs:
         with:
           name: scwc-client-${{ needs.resolve.outputs.tag }}-windows-${{ matrix.arch }}.zip
           path: app/scwc-client-${{ needs.resolve.outputs.tag }}-windows-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+      - name: Install Inno Setup
+        # Pinned via the Chocolatey package version (SHA pinning is not
+        # available for choco).
+        run: choco install innosetup --version=6.7.1 --no-progress -y
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          $ver = $env:TAG -replace '^v', ''
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion="$ver" /DArch="${{ matrix.arch }}" app\installer\windows\sc_webcam.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scwc-client-${{ needs.resolve.outputs.tag }}-windows-${{ matrix.arch }}-setup.exe
+          path: app/scwc-client-${{ needs.resolve.outputs.tag }}-windows-${{ matrix.arch }}-setup.exe
           if-no-files-found: error
 
   linux:
@@ -131,10 +183,32 @@ jobs:
             clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev \
             libstdc++-12-dev libva-dev
 
-      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+      # See the windows job for why arm64 cannot use flutter-action.
+      - name: Install Flutter (x64)
+        if: matrix.arch == 'x64'
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
+
+      - name: Cache Flutter SDK (arm64)
+        if: matrix.arch == 'arm64'
+        id: flutter-sdk-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/flutter
+          key: flutter-sdk-${{ env.FLUTTER_VERSION }}-linux-arm64
+
+      - name: Install Flutter SDK (arm64, git clone)
+        if: matrix.arch == 'arm64' && steps.flutter-sdk-cache.outputs.cache-hit != 'true'
+        run: git clone --depth 1 --branch ${{ env.FLUTTER_VERSION }} https://github.com/flutter/flutter.git ~/flutter
+
+      - name: Bootstrap Flutter SDK (arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
+          ~/flutter/bin/flutter --version  # GITHUB_PATH applies to later steps only
 
       - name: Build Flutter app (Linux, ${{ matrix.arch }})
         working-directory: app
@@ -220,6 +294,7 @@ jobs:
 
       - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
 
@@ -261,6 +336,7 @@ jobs:
 
       - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
 

@@ -1,5 +1,9 @@
 //! The [`FrameSource`] implementation: channel plumbing between the backend callbacks and
 //! the core.
+//!
+//! The encoded frames go one way — backend callback to core — and the live preview goes the
+//! other: every backend offers the frames it captures to [`scwc_core::preview`], which owns
+//! the sink, the conversion and the scaling.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -24,6 +28,47 @@ pub(crate) type FrameCallback =
 pub(crate) type JpegCallback =
     unsafe extern "C" fn(user: *mut c_void, data: *const u8, len: usize);
 
+/// Backend entry point for one live preview frame: tightly packed BGRA, `width * height` of them.
+///
+/// The Apple shim hands a frame over this way, having already rendered it into the layout the
+/// core wants — CoreVideo's buffers carry row padding the core knows nothing about. The Linux
+/// and Windows backends convert their frames in this crate and reach
+/// [`scwc_core::preview::publish_bgra`] directly.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) type PreviewCallback =
+    unsafe extern "C" fn(user: *mut c_void, data: *const u8, len: usize, width: u32, height: u32);
+
+/// Backend entry point a backend asks whether preview frames are wanted at all.
+///
+/// A conversion reads the whole frame, so a backend that can skip it cheaply — the Apple shim
+/// renders the frame into BGRA for every preview it produces — asks this first.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) type PreviewWanted = unsafe extern "C" fn(user: *mut c_void) -> i32;
+
+/// The preview callback the Apple shim hands its frames to.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) unsafe extern "C" fn on_preview(
+    _user: *mut c_void,
+    data: *const u8,
+    len: usize,
+    width: u32,
+    height: u32,
+) {
+    if data.is_null() {
+        return;
+    }
+    // SAFETY: the caller hands back a pointer to a buffer that stays valid for the duration of
+    // the call, which converts (and copies) what it needs before returning.
+    let pixels = unsafe { slice::from_raw_parts(data, len) };
+    scwc_core::preview::publish_bgra(pixels, width, height);
+}
+
+/// Whether a preview is wanted right now; see [`scwc_core::preview::preview_enabled`].
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) unsafe extern "C" fn preview_wanted(_user: *mut c_void) -> i32 {
+    i32::from(scwc_core::preview::preview_enabled())
+}
+
 /// How long a keyframe waits for space in the queue before retrying.
 const KEYFRAME_RETRY_DELAY: Duration = Duration::from_millis(2);
 
@@ -42,6 +87,9 @@ const KEYFRAME_RETRY_LIMIT: usize = 1000;
 pub(crate) struct CallbackState {
     frames: mpsc::Sender<EncodedFrame>,
     photos: mpsc::Sender<Vec<u8>>,
+    /// When the queue-full warning was last emitted; the mutex is uncontended except
+    /// on the (already slow) full-queue path.
+    last_full_warning: std::sync::Mutex<std::time::Instant>,
 }
 
 /// Opens a camera and starts capturing.
@@ -56,6 +104,10 @@ pub fn open(cfg: CaptureConfig) -> Result<CaptureSource, CaptureError> {
     let state = Box::new(CallbackState {
         frames: frames_tx,
         photos: photos_tx,
+        // Long ago, so the first full queue still warns immediately.
+        last_full_warning: std::sync::Mutex::new(
+            std::time::Instant::now() - Duration::from_secs(60),
+        ),
     });
 
     // The backend copies everything it needs out of `cfg` and `state` before returning.
@@ -115,7 +167,17 @@ pub(crate) unsafe extern "C" fn on_frame(
                     }
                 }
             }
-            warn!("dropping a keyframe: the frame queue stayed full");
+            // Rate-limit: standby keeps the camera encoding with no consumer, so a
+            // permanently full queue is expected there and must not spam the log
+            // (or the UI event stream, which forwards every warning).
+            let mut last = state
+                .last_full_warning
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if last.elapsed() >= Duration::from_secs(30) {
+                *last = std::time::Instant::now();
+                warn!("dropping a keyframe: the frame queue stayed full");
+            }
         }
     }
 }
@@ -180,6 +242,17 @@ impl FrameSource for CaptureSource {
     ) -> Result<(), SourceError> {
         let (width, height) = parse_resolution(resolution)
             .ok_or_else(|| SourceError::from(format!("malformed resolution {resolution:?}")))?;
+        // Reconfiguring tears down and rebuilds the backend pipeline, so an
+        // identical request must not touch it: session start re-applies the
+        // announced parameters every time, and they usually match.
+        if self.cfg.width == width
+            && self.cfg.height == height
+            && self.cfg.fps == fps
+            && self.cfg.codec == codec
+            && self.cfg.bitrate_kbps == bitrate_kbps
+        {
+            return Ok(());
+        }
         self.handle
             .set_parameters(width, height, fps, codec, bitrate_kbps)?;
         self.cfg.width = width;

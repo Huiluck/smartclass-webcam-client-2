@@ -15,16 +15,30 @@ scwc-capture = { path = "../../crates/capture" }
 scwc-protocol = { path = "../../crates/protocol" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 
-# `log` is used by the panic hook on every platform, so it belongs here rather than in the
-# Android-only block; only the logcat backend itself is Android-specific. `tracing`'s `log`
-# feature (enabled workspace-wide) is what mirrors the core's events into `log` records.
-log = "0.4"
+# The crates log through tracing, which does nothing without a subscriber; the app installs one.
+tracing = "0.1"
+tracing-subscriber = "0.3"
 
-# The core logs through `tracing`; without a `log` backend in this process its diagnostics —
-# registration failures, retry delays — never leave the library, and an Android app's standard
-# streams do not reach logcat either.
-[target.'cfg(target_os = "android")'.dependencies]
-android_logger = "0.15"
+# The `wss://` attach runs on rustls 0.23, whose crypto provider is chosen at build time. This
+# crate installs it at init (see `install_crypto_provider`) and therefore names both the crate
+# and the provider: `ring`, the one `scwc-core` selects for the same reason — no cmake, and
+# already in the dependency graph.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+# The server identity the UI stores lives in a JSON file next to the core's capture state.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Platform configuration directory for the capture-parameter state the core persists.
+dirs = "6"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
+
+# iOS fix: backtrace's apple "libs_macos" code calls libc's `_dyld_*` functions,
+# which libc now only exposes on macOS (it gates them with target_os = "macos").
+# The vendored copy declares them as plain externs instead; see the
+# SCWC PATCH comment in third_party/backtrace/src/symbolize/gimli/libs_macos.rs.
+# Drop this once rust-lang/backtrace-rs supports non-macOS Apple targets.
+[patch.crates-io]
+backtrace = { path = "../../third_party/backtrace" }
