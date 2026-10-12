@@ -42,6 +42,9 @@ const KEYFRAME_RETRY_LIMIT: usize = 1000;
 pub(crate) struct CallbackState {
     frames: mpsc::Sender<EncodedFrame>,
     photos: mpsc::Sender<Vec<u8>>,
+    /// When the queue-full warning was last emitted; the mutex is uncontended except
+    /// on the (already slow) full-queue path.
+    last_full_warning: std::sync::Mutex<std::time::Instant>,
 }
 
 /// Opens a camera and starts capturing.
@@ -56,6 +59,10 @@ pub fn open(cfg: CaptureConfig) -> Result<CaptureSource, CaptureError> {
     let state = Box::new(CallbackState {
         frames: frames_tx,
         photos: photos_tx,
+        // Long ago, so the first full queue still warns immediately.
+        last_full_warning: std::sync::Mutex::new(
+            std::time::Instant::now() - Duration::from_secs(60),
+        ),
     });
 
     // The backend copies everything it needs out of `cfg` and `state` before returning.
@@ -115,7 +122,17 @@ pub(crate) unsafe extern "C" fn on_frame(
                     }
                 }
             }
-            warn!("dropping a keyframe: the frame queue stayed full");
+            // Rate-limit: standby keeps the camera encoding with no consumer, so a
+            // permanently full queue is expected there and must not spam the log
+            // (or the UI event stream, which forwards every warning).
+            let mut last = state
+                .last_full_warning
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if last.elapsed() >= Duration::from_secs(30) {
+                *last = std::time::Instant::now();
+                warn!("dropping a keyframe: the frame queue stayed full");
+            }
         }
     }
 }
@@ -180,6 +197,17 @@ impl FrameSource for CaptureSource {
     ) -> Result<(), SourceError> {
         let (width, height) = parse_resolution(resolution)
             .ok_or_else(|| SourceError::from(format!("malformed resolution {resolution:?}")))?;
+        // Reconfiguring tears down and rebuilds the backend pipeline, so an
+        // identical request must not touch it: session start re-applies the
+        // announced parameters every time, and they usually match.
+        if self.cfg.width == width
+            && self.cfg.height == height
+            && self.cfg.fps == fps
+            && self.cfg.codec == codec
+            && self.cfg.bitrate_kbps == bitrate_kbps
+        {
+            return Ok(());
+        }
         self.handle
             .set_parameters(width, height, fps, codec, bitrate_kbps)?;
         self.cfg.width = width;
