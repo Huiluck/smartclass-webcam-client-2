@@ -1,4 +1,4 @@
-name: release
+name: Release
 
 # Packages the Flutter clients for every desktop platform plus an unsigned iOS
 # build, and publishes them as GitHub release assets. `v*` tags trigger it;
