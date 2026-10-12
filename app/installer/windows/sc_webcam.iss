@@ -14,12 +14,14 @@
 AppId={{7B3E9A1D-2C4F-4E5A-9B6D-1F0A3C5E7D9B}
 AppName={#AppName}
 AppVersion={#AppVersion}
-DefaultDirName={localappdata}\Programs\{#AppName}
+; {autopf} resolves per install mode: Program Files for an all-users
+; (elevated) install, %LOCALAPPDATA%\Programs for a per-user install.
+DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
-; Per-user install: no UAC prompt, no admin rights needed.
+; Offer "for all users / just for me" up front; choosing all users triggers
+; the UAC prompt, per-user stays unelevated.
 PrivilegesRequired=lowest
-OutputDir=..\..
-OutputBaseFilename=scwc-client-v{#AppVersion}-windows-{#Arch}-setup
+PrivilegesRequiredOverridesAllowed=dialog
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
