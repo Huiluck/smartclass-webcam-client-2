@@ -47,6 +47,20 @@ typedef void (*scwc_mac_frame_cb)(void *user, const uint8_t *data, size_t len,
 /* One JPEG still; fired at most once per `scwc_mac_take_photo` call. */
 typedef void (*scwc_mac_jpeg_cb)(void *user, const uint8_t *data, size_t len);
 
+/* One live preview frame, tightly packed BGRA (blue, green, red, alpha, one byte each, no row
+ * padding): `width * height` pixels at `data`, `len` bytes long. Fired for every captured frame
+ * while a preview callback is registered and its gate says the frame is wanted. The callback is
+ * expected to copy what it needs before returning: the buffer belongs to the shim. */
+typedef void (*scwc_mac_preview_cb)(void *user, const uint8_t *data, size_t len, uint32_t width,
+                                    uint32_t height);
+
+/* Whether preview frames are wanted right now: non-zero means yes.
+ *
+ * Consulted before a frame is converted, which is what keeps a preview nobody is watching from
+ * costing a colour conversion per frame. It is called on the capture's own queue and must
+ * return promptly. */
+typedef int32_t (*scwc_mac_preview_wanted_cb)(void *user);
+
 /* Device status change; `state` is a thermal state — 0 nominal, 1 fair, 2 serious, 3 critical
  * — or SCWC_MAC_STATUS_FAILURE, which reports that the pipeline hit a hard failure and that
  * capture has probably stopped. Thermal states are iOS-only: the shim subscribes to
@@ -77,6 +91,12 @@ int32_t scwc_mac_open(const scwc_mac_config *cfg, scwc_mac_frame_cb frame_cb, vo
 /* Registers the device status callback, or unregisters it when `cb` is NULL. The callback
  * stays registered until it is replaced, so a `scwc_mac_set_params` reconfigure keeps it. */
 int32_t scwc_mac_set_status_cb(void *handle, scwc_mac_status_cb cb, void *user);
+
+/* Registers the preview callback and its gate, or unregisters both when `cb` is NULL. Like the
+ * status callback, it survives a `scwc_mac_set_params` reconfigure: a parameter switch is not a
+ * reason to re-register the preview. */
+int32_t scwc_mac_set_preview_cb(void *handle, scwc_mac_preview_cb cb, void *user,
+                                scwc_mac_preview_wanted_cb wanted);
 
 /* Rebuilds the session and the encoder for new parameters. A failure leaves the pipeline that
  * is running — and the frames it delivers — in place, on the parameters it already had. */

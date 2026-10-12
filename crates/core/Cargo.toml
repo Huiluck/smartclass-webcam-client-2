@@ -10,7 +10,14 @@ scwc-protocol = { path = "../protocol" }
 
 tokio = { workspace = true, features = ["net"] }
 # The TLS feature is required for `wss://`; without it `connect_async` refuses secure URLs.
+# Neither that feature nor `rustls-tls-webpki-roots` picks a crypto provider — rustls 0.23 is
+# built with `default-features = false` all the way up — so the provider is selected here.
+# Exactly one may be compiled in: `ring`, which needs no cmake and is what the rest of the
+# tree already builds (reqwest's `rustls-tls` selects it for its own rustls). With none
+# selected, rustls panics when the first `wss://` attach builds its configuration, with both
+# it panics as well. See `rust_lib`'s init, which installs the selected provider explicitly.
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 reqwest = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }

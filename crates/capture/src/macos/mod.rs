@@ -15,7 +15,7 @@ use scwc_protocol::Codec;
 use tracing::{error, info, warn};
 
 use crate::error::CaptureError;
-use crate::source::{FrameCallback, JpegCallback};
+use crate::source::{FrameCallback, JpegCallback, PreviewCallback, PreviewWanted, on_preview, preview_wanted};
 use crate::{CameraInfo, CaptureConfig};
 
 /// The shim's success code.
@@ -86,6 +86,14 @@ unsafe extern "C" {
         cb: Option<StatusCallback>,
         user: *mut c_void,
     ) -> i32;
+    /// `cb` and `wanted` are both null to unregister, and either may be null in a call that
+    /// registers nothing.
+    fn scwc_mac_set_preview_cb(
+        handle: *mut c_void,
+        cb: Option<PreviewCallback>,
+        user: *mut c_void,
+        wanted: Option<PreviewWanted>,
+    ) -> i32;
     fn scwc_mac_set_params(
         handle: *mut c_void,
         width: u32,
@@ -154,7 +162,32 @@ impl Handle {
             handle.close();
             return Err(error);
         }
+        // The preview is fed through the same handle: the shim consults the gate before it
+        // converts anything, so this costs nothing while the interface shows no preview, and it
+        // survives a reconfigure, so a parameter switch needs no re-registration.
+        if let Err(error) =
+            handle.set_preview_callback(Some(on_preview), ptr::null_mut(), Some(preview_wanted))
+        {
+            handle.close();
+            return Err(error);
+        }
         Ok(handle)
+    }
+
+    /// Registers the shim's preview callback and its gate; `None` unregisters both.
+    fn set_preview_callback(
+        &self,
+        cb: Option<PreviewCallback>,
+        user: *mut c_void,
+        wanted: Option<PreviewWanted>,
+    ) -> Result<(), CaptureError> {
+        // SAFETY: as in `set_status_callback`; both callbacks are `'static` functions that
+        // never unwind, so no panic can cross into the shim.
+        let status = unsafe { scwc_mac_set_preview_cb(self.raw, cb, user, wanted) };
+        if status != OK {
+            return Err(last_error());
+        }
+        Ok(())
     }
 
     /// Registers the shim's device-status callback; `None` unregisters it.

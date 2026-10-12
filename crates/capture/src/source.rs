@@ -1,5 +1,9 @@
 //! The [`FrameSource`] implementation: channel plumbing between the backend callbacks and
 //! the core.
+//!
+//! The encoded frames go one way — backend callback to core — and the live preview goes the
+//! other: every backend offers the frames it captures to [`scwc_core::preview`], which owns
+//! the sink, the conversion and the scaling.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -23,6 +27,47 @@ pub(crate) type FrameCallback =
 /// Backend entry point for one JPEG still.
 pub(crate) type JpegCallback =
     unsafe extern "C" fn(user: *mut c_void, data: *const u8, len: usize);
+
+/// Backend entry point for one live preview frame: tightly packed BGRA, `width * height` of them.
+///
+/// The Apple shim hands a frame over this way, having already rendered it into the layout the
+/// core wants — CoreVideo's buffers carry row padding the core knows nothing about. The Linux
+/// and Windows backends convert their frames in this crate and reach
+/// [`scwc_core::preview::publish_bgra`] directly.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) type PreviewCallback =
+    unsafe extern "C" fn(user: *mut c_void, data: *const u8, len: usize, width: u32, height: u32);
+
+/// Backend entry point a backend asks whether preview frames are wanted at all.
+///
+/// A conversion reads the whole frame, so a backend that can skip it cheaply — the Apple shim
+/// renders the frame into BGRA for every preview it produces — asks this first.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) type PreviewWanted = unsafe extern "C" fn(user: *mut c_void) -> i32;
+
+/// The preview callback the Apple shim hands its frames to.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) unsafe extern "C" fn on_preview(
+    _user: *mut c_void,
+    data: *const u8,
+    len: usize,
+    width: u32,
+    height: u32,
+) {
+    if data.is_null() {
+        return;
+    }
+    // SAFETY: the caller hands back a pointer to a buffer that stays valid for the duration of
+    // the call, which converts (and copies) what it needs before returning.
+    let pixels = unsafe { slice::from_raw_parts(data, len) };
+    scwc_core::preview::publish_bgra(pixels, width, height);
+}
+
+/// Whether a preview is wanted right now; see [`scwc_core::preview::preview_enabled`].
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) unsafe extern "C" fn preview_wanted(_user: *mut c_void) -> i32 {
+    i32::from(scwc_core::preview::preview_enabled())
+}
 
 /// How long a keyframe waits for space in the queue before retrying.
 const KEYFRAME_RETRY_DELAY: Duration = Duration::from_millis(2);
