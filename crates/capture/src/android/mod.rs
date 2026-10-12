@@ -32,7 +32,7 @@
 //!
 //! - **Streaming**: registered and attached, then sent 1280x720@60 H.264 from the hardware
 //!   encoder with `dropped 0` in the core's counters, and later 3840x2160@60 at that same
-//!   cadence: every steady-state segment row advances 150 frames per ~2500 ms flush, and 2 220
+//!   cadence: every steady-state segment row advances 150 frames per ~2500 ms flush, and 2220
 //!   frames land in ~37.6 s of segment time (≈59 fps). Those rows carry ~62 MB in total, ≈13 Mbps
 //!   — the 11.3 MB opening row is the first IDR, not the rate. The stream's wall-clock window was
 //!   ~78 s, so the dev server persisted about half of it; closing that gap is what a soak run is
@@ -42,10 +42,9 @@
 //!   flowing afterwards.
 //! - **`take_photo`**: a still came back as a 210 KB `image/jpeg` carrying the `request_id` of
 //!   the command that asked for it.
-//! - **Thermal step-down**: not exercised. The monitor starts and reports `nominal` on this
-//!   device, but no run has produced a thermal transition, so the step-down itself is still
-//!   only reasoned-about code; proving it needs either a device under real heat or an injected
-//!   status.
+//! - **Thermal step-down**: out of scope. The plan's thermal policy (bitrate step-down on
+//!   pressure) is not being built — the protocol has no field for a device to report thermal
+//!   state, so a step-down would be invisible to the server and untestable from it.
 //!
 //! # Why a run from `adb shell` says nothing about this backend
 //!
