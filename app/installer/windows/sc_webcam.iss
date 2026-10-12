@@ -22,6 +22,8 @@ DefaultGroupName={#AppName}
 ; the UAC prompt, per-user stays unelevated.
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
+OutputDir=..\..
+OutputBaseFilename=scwc-client-v{#AppVersion}-windows-{#Arch}-setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
