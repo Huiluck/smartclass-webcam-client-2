@@ -31,11 +31,10 @@
 //!   verified on hardware through the Flutter shell; a sustained wall-clock rate is not — the
 //!   run was minutes, not a soak. Thermal step-down is not built: the plan asks for it,
 //!   nothing in this backend measures heat, and the configured bitrate stands until an
-//!   operator changes it. The `CAMERA` permission is held
-//!   per process on this platform: an installed app gets it from the user, while a native
-//!   binary run from `adb shell` is at the mercy of the vendor's own policy, which on one
-//!   vendor's devices means its camera HAL aborts on such a client's first request (the
-//!   `android` module records that).
+//!   operator changes it. The `CAMERA` permission is held per process on this platform: an
+//!   installed app gets it from the user, while a native binary run from `adb shell` is at the
+//!   mercy of the vendor's own policy, which on one vendor's devices means its camera HAL
+//!   aborts on such a client's first request (the `android` module records that).
 //! - **Everything else**: [`enumerate_cameras`] and [`open`] fail with
 //!   [`CaptureError::Os`]; the crate still compiles so that the rest of the workspace can
 //!   be built and tested on any host.
