@@ -6,6 +6,8 @@ import 'package:app/src/rust/frb_generated.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'src/permissions.dart';
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await RustLib.init();
@@ -128,7 +130,7 @@ class AgentState extends ChangeNotifier {
     _restore();
     _notify();
     _events = agentEvents().listen(_onEvent, onError: _onStreamError);
-    refreshCameras();
+    unawaited(refreshCameras());
   }
 
   @override
@@ -215,7 +217,21 @@ class AgentState extends ChangeNotifier {
       bitrate != null;
 
   /// Lists cameras and re-applies the persisted selection.
-  void refreshCameras() {
+  ///
+  /// The runtime camera permission is asked for first: on Android the platform needs the user's
+  /// answer before the capture backend may open a camera, and asking here — on the path that
+  /// every start-up and every refresh goes through — means the dialog is long gone by the time
+  /// an operator presses Start.
+  Future<void> refreshCameras() async {
+    final denial = await CameraPermission.ensureCameraPermission();
+    if (denial != null) {
+      _addLog(denial);
+      _notify();
+      return;
+    }
+    if (_disposed) {
+      return;
+    }
     final List<CameraInfoDto> cameras;
     try {
       cameras = listCameras();

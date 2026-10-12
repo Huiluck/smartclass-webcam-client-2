@@ -27,15 +27,27 @@
 //! protocol lets a device move neither `resolution` nor `fps` without an operator command (see
 //! [`thermal`]).
 //!
-//! What has *not* happened is a frame delivered on hardware. The phone this backend was last
-//! exercised against (a vivo V2405A, MediaTek) aborts its own camera HAL — `SIGABRT` inside
-//! `processCaptureRequest`, a mutex used after destruction in the vendor's `libvcf_session.so`
-//! — on the first request from a native client started through `adb shell`, at every geometry,
-//! template and output tried, while the vendor's own camera app streams from the same device
-//! without trouble. The media path is therefore written against the NDK headers and compiles
-//! and links for `aarch64-linux-android`, and what remains to be proven on hardware is the
-//! same path from inside an installed app, whose client identity this vendor framework does
-//! recognize.
+//! All of that has since run on hardware — a vivo V2405A (MediaTek, Android 16) through the
+//! Flutter shell, which is the context a device client actually runs in:
+//!
+//! - **Streaming**: registered and attached, then sent 1280x720@60 H.264 from the hardware
+//!   encoder for minutes with `dropped 0` in the core's counters.
+//! - **`switch_camera`**: the server moved the camera to 640x480@30; the session and encoder
+//!   were rebuilt on the same open device and frames kept flowing afterwards.
+//! - **`take_photo`**: a still came back as a 210 KB `image/jpeg` carrying the `request_id` of
+//!   the command that asked for it.
+//!
+//! # Why a run from `adb shell` says nothing about this backend
+//!
+//! The same code, run as a native binary from `adb shell`, never delivered a frame on that
+//! phone: its vendor HAL aborts (`SIGABRT` inside `processCaptureRequest`, a mutex used after
+//! destruction in `libvcf_session.so`) on the first request from *any* such client — every
+//! geometry, template and output tried, including the most vanilla `TEMPLATE_PREVIEW` request
+//! there is — while the vendor's own camera app streams from the same device without trouble.
+//! In the app context the identical request path works, so that abort is a property of the
+//! caller the vendor framework does not recognize (a `shell`-uid process with no package),
+//! not of what this backend asks for. Reach for a `adb shell` probe only when a device is
+//! suspected of being wedged, and expect the HAL, not the client, to be the story.
 
 mod camera2;
 mod media;

@@ -26,11 +26,12 @@
 //! - **Android**: the Camera2 NDK for capture and `AMediaCodec` for encoding, both reached
 //!   through hand-written FFI like the Linux backend, so no shim is compiled either.
 //!   Enumeration reports each camera's real capability matrix, and the media path carries
-//!   `switch_camera` rebuilds, stills through a JPEG reader and a thermal encoder step-down;
-//!   the `android` module records exactly what has and has not been proven on hardware. The
-//!   `CAMERA` permission is held per process on this platform, so a run from `adb shell` is
-//!   at the mercy of the vendor's own policy where an installed app gets the permission from
-//!   the user.
+//!   `switch_camera` rebuilds, stills through a JPEG reader and a thermal encoder step-down —
+//!   all three verified on hardware through the Flutter shell. The `CAMERA` permission is held
+//!   per process on this platform: an installed app gets it from the user, while a native
+//!   binary run from `adb shell` is at the mercy of the vendor's own policy, which on one
+//!   vendor's devices means its camera HAL aborts on such a client's first request (the
+//!   `android` module records that).
 //! - **Everything else**: [`enumerate_cameras`] and [`open`] fail with
 //!   [`CaptureError::Os`]; the crate still compiles so that the rest of the workspace can
 //!   be built and tested on any host.
