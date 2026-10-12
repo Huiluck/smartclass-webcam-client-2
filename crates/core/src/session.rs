@@ -507,7 +507,7 @@ mod tests {
         };
         ParamStore::new(Some(path.clone()), None).record_applied(&switched);
 
-        let (source, applied) = RecordingSource::new(Codec::H264);
+        let (source, applied, _encoding) = RecordingSource::new(Codec::H264);
         let source = Arc::new(Mutex::new(source));
         let store = ParamStore::new(Some(path), None);
 
@@ -545,7 +545,7 @@ mod tests {
 
     #[tokio::test]
     async fn without_a_state_file_the_announced_parameters_win() {
-        let (source, applied) = RecordingSource::new(Codec::H264);
+        let (source, applied, _encoding) = RecordingSource::new(Codec::H264);
         let source = Arc::new(Mutex::new(source));
 
         reset_source(

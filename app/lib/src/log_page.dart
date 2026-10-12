@@ -27,25 +27,29 @@ class LogPage extends StatelessWidget {
                   ),
                 ),
                 Expanded(
-                  child: entries.isEmpty
-                      ? const Center(child: Text('No events yet'))
-                      : ListView.builder(
-                          padding: const EdgeInsets.symmetric(horizontal: 12),
-                          itemCount: entries.length,
-                          itemBuilder: (context, index) {
-                            final entry = entries[index];
-                            return Padding(
-                              padding: const EdgeInsets.symmetric(vertical: 2),
-                              child: Text(
-                                '${_formatTime(entry.time)}  ${entry.message}',
-                                style: const TextStyle(
-                                  fontFamily: 'Menlo',
-                                  fontSize: 12,
+                  // The log is there to be copied out of, so its lines can be selected and
+                  // dragged over; a selection spans as many of them as the user takes.
+                  child: SelectionArea(
+                    child: entries.isEmpty
+                        ? const Center(child: Text('No events yet'))
+                        : ListView.builder(
+                            padding: const EdgeInsets.symmetric(horizontal: 12),
+                            itemCount: entries.length,
+                            itemBuilder: (context, index) {
+                              final entry = entries[index];
+                              return Padding(
+                                padding: const EdgeInsets.symmetric(vertical: 2),
+                                child: Text(
+                                  '${_formatTime(entry.time)}  ${entry.message}',
+                                  style: const TextStyle(
+                                    fontFamily: 'Menlo',
+                                    fontSize: 12,
+                                  ),
                                 ),
-                              ),
-                            );
-                          },
-                        ),
+                              );
+                            },
+                          ),
+                  ),
                 ),
               ],
             ),

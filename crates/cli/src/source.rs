@@ -276,6 +276,11 @@ impl FrameSource for SynthSource {
         Ok(jpeg)
     }
 
+    fn set_encoding(&mut self, _enabled: bool) {
+        // This source encodes inside `next_frame`, which the core only calls while a stream is
+        // active: there is nothing to gate.
+    }
+
     fn preferred_codec(&self) -> Codec {
         Codec::H264
     }

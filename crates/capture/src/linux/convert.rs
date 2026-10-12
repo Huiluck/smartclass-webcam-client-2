@@ -210,27 +210,37 @@ pub(crate) fn rgb_from_nv12(
     Ok(())
 }
 
-/// Converts a packed NV12 frame into packed BGRA, replacing the contents of `bgra`.
+/// Converts NV12 into tightly packed BGRA at the size a preview is wanted at, replacing the
+/// contents of `bgra`.
 ///
-/// This is the live preview's layout — four bytes per pixel, blue first — which the core scales
-/// and swaps into the RGBA an image widget takes.
+/// The output is `out_width`x`out_height` and comes from the frame's own `width`x`height`, so a
+/// preview pass costs the pixels it will be shown at rather than the capture resolution. Each
+/// output pixel takes the source pixel its centre falls on: resampling the frame for a preview
+/// would cost more than the conversion does.
+///
+/// This is the layout the core wants — four bytes per pixel, blue first — which it swaps into the
+/// RGBA an image widget takes.
 pub(crate) fn bgra_from_nv12(
     source: &[u8],
     pitch: usize,
     width: usize,
     height: usize,
+    out_width: usize,
+    out_height: usize,
     bgra: &mut Vec<u8>,
 ) -> Result<(), CaptureError> {
     let luma_len = width * height;
     let chroma_base = pitch * height;
     require_capacity(source, luma_len)?;
     bgra.clear();
-    bgra.reserve(luma_len * 4);
+    bgra.reserve(out_width * out_height * 4);
 
-    for row in 0..height {
+    for out_row in 0..out_height {
+        let row = source_index(out_row, out_height, height);
         let luma_row = row_slice(source, row * pitch, width)?;
         let chroma_row = row_slice(source, chroma_base + (row / 2) * pitch, width)?;
-        for column in 0..width {
+        for out_column in 0..out_width {
+            let column = source_index(out_column, out_width, width);
             let (red, green, blue) = rgb_of(
                 luma_row[column],
                 chroma_row[(column / 2) * 2],
@@ -240,6 +250,11 @@ pub(crate) fn bgra_from_nv12(
         }
     }
     Ok(())
+}
+
+/// The source index one output pixel samples, nearest the centre of the pixel it covers.
+fn source_index(out_index: usize, out_len: usize, source_len: usize) -> usize {
+    ((2 * out_index + 1) * source_len / (2 * out_len)).min(source_len - 1)
 }
 
 /// Converts packed YUYV (4:2:2) into RGB24, replacing the contents of `rgb`.

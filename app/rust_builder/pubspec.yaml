@@ -29,6 +29,6 @@ flutter:
       linux:
         ffiPlugin: true
       macos:
-        ffiPlugin: true
+        pluginClass: ScwcPreviewPlugin
       windows:
         ffiPlugin: true

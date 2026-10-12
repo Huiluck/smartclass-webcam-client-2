@@ -3,6 +3,11 @@
 //! Lists the cameras when no id is given, opens one, then pulls frames for a fixed number
 //! of seconds and prints the achieved frame rate plus the average and maximum encoded frame
 //! size every second, with the keyframe sizes broken out.
+//!
+//! The camera opens with its encoder idle — frames are only produced for a consumer — so the
+//! probe is the consumer: it starts encoding before the first frame, and `--encoding-check`
+//! shows that a camera nobody reads delivers nothing, and that the stream it then starts on
+//! begins with a keyframe.
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -85,6 +90,14 @@ struct Args {
     /// Codec the hardware encoder produces.
     #[arg(long, value_enum, default_value = "h264")]
     codec: CodecArg,
+    /// Check the encoding gate before measuring: no frame must arrive while nothing is reading
+    /// them, and the first frame after a consumer appears must be a keyframe.
+    #[arg(long)]
+    encoding_check: bool,
+    /// How long the camera runs with no consumer before the measurement asks for a frame. Only
+    /// used by `--encoding-check`, and long enough to watch what an idle camera does.
+    #[arg(long, value_parser = clap::value_parser!(u64), default_value_t = 3)]
+    idle_seconds: u64,
 }
 
 /// Prints one camera in the form the operator reads out on the command line.
@@ -232,6 +245,29 @@ async fn main() -> ExitCode {
     // phone-as-webcam) can take tens of seconds to deliver after the session opens, so the
     // measurement window begins at the first frame, not at open().
     let opened = Instant::now();
+
+    // The camera is opened with its encoder idle, and this probe is the consumer: nothing is
+    // reading frames yet, so a camera that encodes ahead of one would deliver here anyway.
+    if args.encoding_check {
+        match timeout(Duration::from_secs(args.idle_seconds), source.next_frame()).await {
+            Err(_) => println!(
+                "no frame in {:.1}s while encoding is off (expected)",
+                args.idle_seconds as f64
+            ),
+            Ok(frame) => {
+                eprintln!(
+                    "a frame of {} bytes arrived while encoding was off",
+                    frame.data.len()
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // A consumer is here, so the camera starts encoding — the core does the same when a stream
+    // becomes active — and the first frame of that stream has to be a keyframe.
+    source.set_encoding(true);
+
     let first = match timeout(Duration::from_secs(60), source.next_frame()).await {
         Ok(frame) => frame,
         Err(_) => {
@@ -239,7 +275,16 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    println!("first frame after {:.1?} ({} bytes)", opened.elapsed(), first.data.len());
+    if args.encoding_check && !first.is_keyframe {
+        eprintln!("the first frame after enabling encoding was not a keyframe");
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "first frame after {:.1?} ({} bytes, keyframe={})",
+        opened.elapsed(),
+        first.data.len(),
+        first.is_keyframe,
+    );
 
     let started = Instant::now();
     let deadline = started + Duration::from_secs(args.seconds);

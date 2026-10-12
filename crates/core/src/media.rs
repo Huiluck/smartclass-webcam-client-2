@@ -80,6 +80,19 @@ pub trait FrameSource: Send {
     /// Captures a single still image as JPEG bytes.
     fn take_photo(&mut self) -> impl Future<Output = Result<Vec<u8>, SourceError>> + Send;
 
+    /// Tells the source whether a consumer is taking frames at all.
+    ///
+    /// The core calls this with `true` when a stream becomes active and with `false` once none
+    /// is. A backend that encodes ahead of the consumer — macOS encodes every captured frame
+    /// with the hardware encoder even when nobody reads the result — must stop that work while
+    /// it is told `false`: encoding frames nobody reads costs the capture path power and latency
+    /// it cannot afford, and a preview that runs without a stream is exactly the case where that
+    /// waste is visible.
+    ///
+    /// Turning it back on must make a recording start on a keyframe: the next frame a source
+    /// encodes after this call is an IDR, so a stream never begins in the middle of a GOP.
+    fn set_encoding(&mut self, enabled: bool);
+
     /// The codec the source encodes with unless a command overrides it.
     fn preferred_codec(&self) -> Codec;
 }
@@ -116,17 +129,27 @@ pub(crate) mod test_support {
     pub(crate) struct RecordingSource {
         codec: Codec,
         applied: Arc<Mutex<Vec<Applied>>>,
+        encoding: Arc<Mutex<Vec<bool>>>,
     }
 
     impl RecordingSource {
-        /// Builds a source whose reconfigurations are collected in the returned handle.
-        pub(crate) fn new(codec: Codec) -> (Self, Arc<Mutex<Vec<Applied>>>) {
+        /// Builds a source whose reconfigurations and encoding changes are collected in the
+        /// returned handles.
+        pub(crate) fn new(
+            codec: Codec,
+        ) -> (
+            Self,
+            Arc<Mutex<Vec<Applied>>>,
+            Arc<Mutex<Vec<bool>>>,
+        ) {
             let applied = Arc::new(Mutex::new(Vec::new()));
+            let encoding = Arc::new(Mutex::new(Vec::new()));
             let source = Self {
                 codec,
                 applied: applied.clone(),
+                encoding: encoding.clone(),
             };
-            (source, applied)
+            (source, applied, encoding)
         }
     }
 
@@ -156,6 +179,13 @@ pub(crate) mod test_support {
 
         async fn take_photo(&mut self) -> Result<Vec<u8>, SourceError> {
             Ok(Vec::new())
+        }
+
+        fn set_encoding(&mut self, enabled: bool) {
+            self.encoding
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(enabled);
         }
 
         fn preferred_codec(&self) -> Codec {

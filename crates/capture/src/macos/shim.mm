@@ -57,14 +57,34 @@
   void *_frameUser;
   scwc_mac_status_cb _statusCallback;
   void *_statusUser;
-  /// Preview state, guarded by `_previewLock`: the callback and its gate, and the tight BGRA
-  /// buffer frames are converted into. The lock is held across a conversion, so a registration
-  /// and a frame being converted cannot interleave; nothing else is held while it is, and the
-  /// Rust side the conversion hands the frame to never re-enters this object.
+  /// Preview state, guarded by `_previewLock`: the callback and its gate.
+  ///
+  /// The gate is what decides whether a frame is produced at all, and it is asked on the capture
+  /// queue, which is why it is only ever a look at this state. The conversion itself runs on
+  /// `_previewQueue`, one frame at a time, and never touches the lock: `_previewPixels` belongs
+  /// to that queue alone.
   scwc_mac_preview_cb _previewCallback;
   void *_previewUser;
   scwc_mac_preview_wanted_cb _previewWanted;
   std::mutex _previewLock;
+  /// The consumer of the platform's own buffers, guarded by `_previewLock` like the preview
+  /// callback above. Only one of the two is ever registered by the Rust side: a consumer that
+  /// takes the buffer itself needs no conversion, and a consumer of converted frames needs no
+  /// buffer.
+  scwc_mac_frame_slot_cb _frameSlotCallback;
+  void *_frameSlotUser;
+  /// Serial queue every preview conversion runs on, off the capture queue.
+  dispatch_queue_t _previewQueue;
+  /// Whether the hardware encoder is being fed.
+  ///
+  /// The capture delegate reads it and Rust writes it, from another thread, so it is atomic; it
+  /// starts false, which is what makes a camera with no stream cost no encoding at all.
+  std::atomic<bool> _encoding;
+  /// Set when the encoder is turned back on, so the first frame it is handed is an IDR: a stream
+  /// that starts here must not begin in the middle of a GOP.
+  std::atomic<bool> _forceKeyframe;
+  /// Staging for one converted frame, tightly packed BGRA at the size Rust asked for. Written and
+  /// read on `_previewQueue` only.
   std::vector<uint8_t> _previewPixels;
   int32_t _codec;
   uint32_t _width;
@@ -103,8 +123,23 @@
 - (void)setPreviewCallback:(scwc_mac_preview_cb)callback
                       user:(void *)user
                     wanted:(scwc_mac_preview_wanted_cb)wanted;
-/// Converts one captured frame to BGRA and hands it to Rust, unless nothing wants it.
+/// Asks the gate where the next preview frame should be rendered, if anywhere, and hands the
+/// frame to `_previewQueue`; runs on the capture queue and returns at once.
 - (void)publishPreview:(CVPixelBufferRef)pixel_buffer;
+/// Hands one captured frame over as the platform's own buffer, to a consumer that renders it
+/// itself; runs on the capture queue and does nothing at all while none is registered.
+- (void)publishFrameSlot:(CVPixelBufferRef)pixel_buffer;
+/// Registers the consumer of the platform's own buffers, or clears it when `callback` is NULL.
+- (void)setFrameSlotCallback:(scwc_mac_frame_slot_cb)callback user:(void *)user;
+/// Turns the hardware encoder on or off; see `scwc_mac_set_encoding`.
+- (void)setEncoding:(BOOL)enabled;
+/// Renders one captured frame at exactly `width`x`height` and hands it to Rust; runs on
+/// `_previewQueue`.
+- (void)renderPreview:(CVPixelBufferRef)pixel_buffer
+                width:(uint32_t)width
+               height:(uint32_t)height
+             callback:(scwc_mac_preview_cb)callback
+                 user:(void *)user;
 /// Subscribes to the notifications that report a failed session and thermal pressure.
 - (void)subscribeNotifications;
 /// Cancels those subscriptions; afterwards no notification block reaches this object again.
@@ -529,6 +564,7 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
   self = [super init];
   if (self != nil) {
     _delegateQueue = dispatch_queue_create("scwc.capture.frames", DISPATCH_QUEUE_SERIAL);
+    _previewQueue = dispatch_queue_create("scwc.capture.preview", DISPATCH_QUEUE_SERIAL);
     _session = nil;
     _output = nil;
     _device = nil;
@@ -542,6 +578,8 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
     _previewCallback = NULL;
     _previewUser = NULL;
     _previewWanted = NULL;
+    _frameSlotCallback = NULL;
+    _frameSlotUser = NULL;
     _codec = 0;
     _width = 0;
     _height = 0;
@@ -748,6 +786,51 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
   _statusUser = user;
 }
 
+/// Registers the consumer of the platform's own buffers, or clears it when `callback` is NULL.
+- (void)setFrameSlotCallback:(scwc_mac_frame_slot_cb)callback user:(void *)user {
+  std::lock_guard<std::mutex> guard(_previewLock);
+  _frameSlotCallback = callback;
+  _frameSlotUser = user;
+}
+
+/// Turns the hardware encoder on or off.
+///
+/// Off, the capture delegate publishes preview frames and stops there: the camera keeps running,
+/// the picture keeps updating, and nothing is encoded. A camera with no stream is in this state,
+/// and it is why an idle camera no longer pays for — or blocks on — an encoder nobody reads.
+- (void)setEncoding:(BOOL)enabled {
+  if (enabled) {
+    // Remembered before the flag flips: the delegate may pick the frame up in between, and a
+    // recording that started without its IDR would have to wait a whole GOP for one.
+    _forceKeyframe.store(true, std::memory_order_release);
+    _encoding.store(true, std::memory_order_release);
+    return;
+  }
+  _encoding.store(false, std::memory_order_release);
+}
+
+/// Hands one captured frame over as the platform's own buffer, to a consumer that renders it
+/// itself; runs on the capture queue and does nothing at all while none is registered.
+///
+/// This is the zero-copy path: no conversion, no scaling, no copy of the pixels, just the buffer
+/// the camera produced. The buffer is lent, not given — the capture side recycles its own
+/// reference the moment this returns, and a consumer that keeps the frame retains it through the
+/// shim (`scwc_mac_retain_buffer`) — so nothing is retained here and nothing can leak here.
+- (void)publishFrameSlot:(CVPixelBufferRef)pixel_buffer {
+  scwc_mac_frame_slot_cb callback = NULL;
+  void *user = NULL;
+  {
+    std::lock_guard<std::mutex> guard(_previewLock);
+    callback = _frameSlotCallback;
+    user = _frameSlotUser;
+  }
+  if (callback == NULL) {
+    return;
+  }
+
+  callback(user, pixel_buffer);
+}
+
 /// Publishes the preview callback and the gate it is consulted through; `NULL` stops it.
 ///
 /// Like the status callback, this outlives a reconfigure: a `switch_camera` changes what the
@@ -756,49 +839,93 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
                       user:(void *)user
                     wanted:(scwc_mac_preview_wanted_cb)wanted {
   std::lock_guard<std::mutex> guard(_previewLock);
+  if (callback == NULL && _previewQueue != NULL) {
+    // Nothing will ask for the pixels again, so the render that may still be running is waited
+    // for here rather than left to write into this object after its callbacks are gone.
+    dispatch_sync(_previewQueue, ^{
+    });
+  }
   _previewCallback = callback;
   _previewUser = user;
   _previewWanted = wanted;
-  if (callback == NULL) {
-    // Nothing will ask for the pixels again, so the buffer can go.
-    _previewPixels.clear();
-    _previewPixels.shrink_to_fit();
-  }
 }
 
-/// Converts one captured frame to tightly packed BGRA and hands it to Rust.
+/// Asks the gate where the next frame should be rendered, then hands the frame to the preview
+/// queue; runs on the capture queue and returns without doing any conversion.
 ///
-/// Runs on the capture queue, for every frame, and only while Rust says the picture is wanted:
-/// the conversion reads the whole frame, so a preview nobody looks at must not pay for it. The
-/// frame is handed over at the camera's own size — scaling it to the size the interface shows
-/// it in is the Rust side's job — as one tightly packed buffer, so Rust needs no knowledge of
-/// CoreVideo's row padding.
+/// The gate is what keeps the capture path out of the preview's way: it answers `0` while the
+/// interface shows no preview, while the consumer has not finished with the frame it was handed,
+/// and for a frame too small to be one — and then nothing is rendered at all. When it answers, it
+/// also says the size to render at, which is the interface's own size fitted to the frame, so the
+/// conversion never touches the capture resolution. The frame itself is handed over retained,
+/// because the capture side recycles its own reference the moment this returns.
 - (void)publishPreview:(CVPixelBufferRef)pixel_buffer {
-  std::lock_guard<std::mutex> guard(_previewLock);
-  if (_previewCallback == NULL || _previewWanted == NULL || _previewWanted(_previewUser) == 0) {
+  const size_t frame_width = CVPixelBufferGetWidth(pixel_buffer);
+  const size_t frame_height = CVPixelBufferGetHeight(pixel_buffer);
+  if (frame_width == 0 || frame_height == 0) {
     return;
   }
 
-  const size_t width = CVPixelBufferGetWidth(pixel_buffer);
-  const size_t height = CVPixelBufferGetHeight(pixel_buffer);
+  scwc_mac_preview_cb callback = NULL;
+  scwc_mac_preview_wanted_cb wanted = NULL;
+  void *user = NULL;
+  {
+    std::lock_guard<std::mutex> guard(_previewLock);
+    callback = _previewCallback;
+    wanted = _previewWanted;
+    user = _previewUser;
+  }
+  if (callback == NULL || wanted == NULL) {
+    return;
+  }
+
+  uint32_t width = 0;
+  uint32_t height = 0;
+  if (wanted(user, (uint32_t)frame_width, (uint32_t)frame_height, &width, &height) == 0) {
+    return;
+  }
   if (width == 0 || height == 0) {
     return;
   }
 
-  const size_t row_bytes = width * 4;
-  _previewPixels.resize(row_bytes * height);
+  CVPixelBufferRetain(pixel_buffer);
+  dispatch_async(_previewQueue, ^{
+    [self renderPreview:pixel_buffer width:width height:height callback:callback user:user];
+    CVPixelBufferRelease(pixel_buffer);
+  });
+}
+
+/// Renders one captured frame at exactly `width`x`height` and hands it to Rust.
+///
+/// Runs on `_previewQueue`, so the capture queue is never behind a conversion: the encoder call
+/// that follows the handoff in `captureOutput:` waits for nothing this does. CoreImage scales
+/// while it converts, so a preview is one pass over the frame at the size the interface asked
+/// for, never over the capture resolution.
+- (void)renderPreview:(CVPixelBufferRef)pixel_buffer
+                width:(uint32_t)width
+               height:(uint32_t)height
+             callback:(scwc_mac_preview_cb)callback
+                 user:(void *)user {
+  const size_t row_bytes = (size_t)width * 4;
   @autoreleasepool {
     CIImage *image = [CIImage imageWithCVPixelBuffer:pixel_buffer];
-    [preview_context() render:image
+    CGRect extent = image.extent;
+    if (extent.size.width <= 0 || extent.size.height <= 0) {
+      return;
+    }
+    CIImage *scaled = [image
+        imageByApplyingTransform:CGAffineTransformMakeScale((CGFloat)width / extent.size.width,
+                                                            (CGFloat)height / extent.size.height)];
+    _previewPixels.resize(row_bytes * (size_t)height);
+    [preview_context() render:scaled
                      toBitmap:_previewPixels.data()
                      rowBytes:(ptrdiff_t)row_bytes
-                       bounds:image.extent
+                       bounds:CGRectMake(0, 0, (CGFloat)width, (CGFloat)height)
                        format:kCIFormatBGRA8
                    colorSpace:preview_color_space()];
   }
 
-  _previewCallback(_previewUser, _previewPixels.data(), _previewPixels.size(), (uint32_t)width,
-                   (uint32_t)height);
+  callback(user, _previewPixels.data(), _previewPixels.size(), width, height);
 }
 
 /// Reports one hard failure of the pipeline through the status callback, at most once.
@@ -1357,7 +1484,8 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
   return SCWC_MAC_OK;
 }
 
-/// Keeps the newest frame for `take_photo` and hands it to the encoder.
+/// Keeps the newest frame for `take_photo`, publishes it to whatever is showing a picture, and
+/// hands it to the encoder — but only while the encoder is on.
 ///
 /// The frame is passed on as the connection delivers it: this shim never sets a rotation on
 /// the connection, so nothing here turns the sensor's picture. Both the encoder and
@@ -1387,18 +1515,32 @@ extern "C" void vt_output_callback(void *refcon, void *frame_refcon, OSStatus st
 
   // The preview is fed from the same frame the encoder gets, so the picture the operator sees
   // is the one being recorded. It does nothing at all while no preview is wanted.
+  [self publishFrameSlot:pixel_buffer];
   [self publishPreview:pixel_buffer];
 
   VTCompressionSessionRef encoder = _encoder;
-  if (encoder == NULL) {
-    return;
-  }
-  CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
-  OSStatus status = VTCompressionSessionEncodeFrame(encoder, pixel_buffer, pts, kCMTimeInvalid,
-                                                     NULL, NULL, NULL);
-  if (status != noErr) {
-    // A frame the encoder refuses is the first sign of a pipeline that has stopped encoding.
-    [self reportFailure:[NSString stringWithFormat:@"encoding a frame failed: %d", (int)status]];
+  // No consumer is reading frames, so the encoder is left alone: encoding here would cost the
+  // capture path power and, once its output queue backs up, block this delegate call — which is
+  // exactly the stall an operator sees as a preview that freezes every few seconds.
+  if (encoder != NULL && _encoding.load(std::memory_order_acquire)) {
+    CFDictionaryRef frame_properties = NULL;
+    if (_forceKeyframe.exchange(false, std::memory_order_acq_rel)) {
+      const void *keys[] = { kVTEncodeFrameOptionKey_ForceKeyFrame };
+      const void *values[] = { kCFBooleanTrue };
+      frame_properties = CFDictionaryCreate(kCFAllocatorDefault, keys, values, 1,
+                                            &kCFTypeDictionaryKeyCallBacks,
+                                            &kCFTypeDictionaryValueCallBacks);
+    }
+    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+    OSStatus status = VTCompressionSessionEncodeFrame(encoder, pixel_buffer, pts, kCMTimeInvalid,
+                                                      frame_properties, NULL, NULL);
+    if (frame_properties != NULL) {
+      CFRelease(frame_properties);
+    }
+    if (status != noErr) {
+      // A frame the encoder refuses is the first sign of a pipeline that has stopped encoding.
+      [self reportFailure:[NSString stringWithFormat:@"encoding a frame failed: %d", (int)status]];
+    }
   }
 }
 
@@ -1567,6 +1709,38 @@ extern "C" int32_t scwc_mac_set_preview_cb(void *handle, scwc_mac_preview_cb cb,
   return SCWC_MAC_OK;
 }
 
+extern "C" int32_t scwc_mac_set_frame_slot_cb(void *handle, scwc_mac_frame_slot_cb cb, void *user) {
+  if (handle == NULL) {
+    return fail(SCWC_MAC_ERR_OS, @"frame slot callback set without a handle");
+  }
+  ScwcMacCapture *capture = (__bridge ScwcMacCapture *)handle;
+  [capture setFrameSlotCallback:cb user:user];
+  return SCWC_MAC_OK;
+}
+
+extern "C" void *scwc_mac_retain_buffer(void *buffer) {
+  if (buffer == NULL) {
+    return NULL;
+  }
+  return CVPixelBufferRetain((CVPixelBufferRef)buffer);
+}
+
+extern "C" void scwc_mac_release_buffer(void *buffer) {
+  if (buffer == NULL) {
+    return;
+  }
+  CVPixelBufferRelease((CVPixelBufferRef)buffer);
+}
+
+extern "C" int32_t scwc_mac_set_encoding(void *handle, int32_t enabled) {
+  if (handle == NULL) {
+    return fail(SCWC_MAC_ERR_OS, @"encoding state set without a handle");
+  }
+  ScwcMacCapture *capture = (__bridge ScwcMacCapture *)handle;
+  [capture setEncoding:enabled != 0];
+  return SCWC_MAC_OK;
+}
+
 extern "C" int32_t scwc_mac_set_params(void *handle, uint32_t width, uint32_t height, uint32_t fps,
                                        int32_t codec, uint32_t bitrate_kbps) {
   if (handle == NULL) {
@@ -1596,6 +1770,7 @@ extern "C" void scwc_mac_close(void *handle) {
     // explicitly: after this returns, no callback of any kind can reach Rust.
     [capture setStatusCallback:NULL user:NULL];
     [capture setPreviewCallback:NULL user:NULL wanted:NULL];
+    [capture setFrameSlotCallback:NULL user:NULL];
     [capture shutdown];
   }
 }
