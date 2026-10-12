@@ -1169,6 +1169,7 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "flutter_rust_bridge",
+ "rustls 0.23.45",
  "scwc-capture",
  "scwc-core",
  "scwc-protocol",
@@ -1206,6 +1207,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki 0.103.15",
  "subtle",
@@ -1288,6 +1290,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "reqwest",
+ "rustls 0.23.45",
  "scwc-protocol",
  "serde",
  "serde_json",

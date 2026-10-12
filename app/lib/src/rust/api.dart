@@ -8,9 +8,9 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'api.freezed.dart';
 
-// These functions are ignored because they are not marked as `pub`: `capabilities`, `config_dir`, `emit`, `forward_core_events`, `init_logging`, `into_core`, `log_file_path`, `open_camera`, `parse_codec`, `read_server_config`, `report_stats`, `retry_after`, `runtime`, `send_command`, `server_config_path`, `state_path`, `write_server_config`
+// These functions are ignored because they are not marked as `pub`: `capabilities`, `config_dir`, `emit_preview`, `emit`, `forward_core_events`, `forward_preview_frames`, `init_logging`, `into_core`, `log_file_path`, `open_camera`, `parse_codec`, `read_server_config`, `report_stats`, `retry_after`, `runtime`, `send_command`, `server_config_path`, `state_path`, `write_server_config`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AgentSlot`, `CountingSource`, `MessageVisitor`, `WarnLayer`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `next_frame`, `on_event`, `preferred_codec`, `record_debug`, `record_str`, `set_parameters`, `take_photo`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `next_frame`, `on_event`, `preferred_codec`, `record_debug`, `record_str`, `set_parameters`, `take_photo`
 
 /// Lists the cameras of the host.
 ///
@@ -84,6 +84,25 @@ ServerConfig? loadServerConfig() =>
 /// Only events emitted after the call are delivered, and a subscription that Dart cancelled is
 /// dropped at the next event.
 Stream<AgentEvent> agentEvents() => RustLib.instance.api.crateApiAgentEvents();
+
+/// Subscribes to live preview frames; the returned Dart stream is the camera picture.
+///
+/// Frames arrive only while an agent runs and a target size is set. Only frames captured after the
+/// call are delivered, one is dropped rather than queued while Dart is still decoding the previous
+/// one, and a subscription that Dart cancelled is dropped at the next frame.
+Stream<PreviewFrame> previewStream() =>
+    RustLib.instance.api.crateApiPreviewStream();
+
+/// Sets the size the preview frames are scaled to before they reach Dart.
+///
+/// The UI sends the pixel size of its preview area — the logical size of the area times the device
+/// pixel ratio — on every layout change, and `0x0` while it shows no preview. The capture path
+/// scales every frame aspect-locked to fit inside that box, so no letterboxing ever reaches the
+/// UI: it centres what it gets.
+void setPreviewTargetSize({required int width, required int height}) => RustLib
+    .instance
+    .api
+    .crateApiSetPreviewTargetSize(width: width, height: height);
 
 /// Everything the UI has to know to start the agent.
 class AgentConfig {
@@ -255,6 +274,39 @@ class CameraInfoDto {
           id == other.id &&
           name == other.name &&
           presets == other.presets;
+}
+
+/// One live preview frame of the camera, ready to be turned into a picture.
+///
+/// The capture path converts and scales on the Rust side, so the UI only has to wrap the pixels
+/// in an image and centre it inside its preview area.
+class PreviewFrame {
+  /// Row-major pixels without padding, four bytes each: red, green, blue, alpha.
+  final Uint8List rgba;
+
+  /// Frame width in pixels, after the scaling the UI asked for.
+  final int width;
+
+  /// Frame height in pixels, after the scaling the UI asked for.
+  final int height;
+
+  const PreviewFrame({
+    required this.rgba,
+    required this.width,
+    required this.height,
+  });
+
+  @override
+  int get hashCode => rgba.hashCode ^ width.hashCode ^ height.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is PreviewFrame &&
+          runtimeType == other.runtimeType &&
+          rgba == other.rgba &&
+          width == other.width &&
+          height == other.height;
 }
 
 /// The server identity the client registers with, as the UI shows and stores it.

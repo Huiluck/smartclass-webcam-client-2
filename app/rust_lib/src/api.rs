@@ -53,6 +53,15 @@
 //! first [`start_agent`] installs a process-wide one that appends to a file in the system
 //! temporary directory and forwards warnings and errors of the client crates into the event
 //! stream.
+//!
+//! # Preview
+//!
+//! [`preview_stream`] carries the camera picture while an agent runs: the capture path converts
+//! every frame to RGBA and scales it aspect-locked to the size the UI last set through
+//! [`set_preview_target_size`], and this module hands those frames to every live Dart stream — a
+//! frame Dart has not consumed yet is dropped rather than queued, so the picture follows the
+//! capture rate instead of lagging behind it. The sink is registered with the run and dropped
+//! again when it ends, so a stopped agent does no conversion work at all.
 
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -63,6 +72,7 @@ use std::time::Duration;
 
 use flutter_rust_bridge::frb;
 use scwc_capture::{CaptureConfig, CaptureSource, enumerate_cameras, open};
+use scwc_core::preview::PreviewFrame as CorePreviewFrame;
 use scwc_core::{
     ClientConfig, CoreEvent, EncodedFrame, FrameSource, ServerConfig as CoreServerConfig,
     SwitchParams, UiCommand, default_bitrate_kbps, run,
@@ -116,6 +126,20 @@ pub struct AgentConfig {
     /// Encoder bitrate in kilobits per second; `None` derives one from the codec, the resolution
     /// and the frame rate, which is what an empty bitrate field in the UI means.
     pub bitrate_kbps: Option<u32>,
+}
+
+/// One live preview frame of the camera, ready to be turned into a picture.
+///
+/// The capture path converts and scales on the Rust side, so the UI only has to wrap the pixels
+/// in an image and centre it inside its preview area.
+#[derive(Debug, Clone)]
+pub struct PreviewFrame {
+    /// Row-major pixels without padding, four bytes each: red, green, blue, alpha.
+    pub rgba: Vec<u8>,
+    /// Frame width in pixels, after the scaling the UI asked for.
+    pub width: u32,
+    /// Frame height in pixels, after the scaling the UI asked for.
+    pub height: u32,
 }
 
 /// The server identity the client registers with, as the UI shows and stores it.
@@ -305,6 +329,13 @@ pub async fn start_agent(config: AgentConfig) -> Result<(), String> {
     RECONNECT_ATTEMPTS.store(0, Ordering::Relaxed);
     runtime.spawn(forward_core_events(events_rx));
 
+    // The capture path hands every frame it converts to this sink; the forwarding task turns those
+    // into the frames the UI paints. Registered after the previous run was waited for above, so a
+    // run that is still winding down cannot clear this one's sink.
+    let (preview_tx, preview_rx) = tokio::sync::mpsc::unbounded_channel();
+    scwc_core::preview::set_preview_sink(Some(preview_tx));
+    runtime.spawn(forward_preview_frames(preview_rx));
+
     let frames = Arc::new(AtomicU64::new(0));
     let agent = runtime.spawn(async move {
         emit(AgentEvent::Connecting);
@@ -333,6 +364,9 @@ pub async fn start_agent(config: AgentConfig) -> Result<(), String> {
         if slot.generation == generation {
             slot.shutdown = None;
             slot.commands = None;
+            // The camera is on its way down, so nothing more can be shown; dropping the sender also
+            // ends the forwarding task above.
+            scwc_core::preview::set_preview_sink(None);
         }
     });
 
@@ -360,6 +394,9 @@ pub async fn start_agent(config: AgentConfig) -> Result<(), String> {
 /// [`start_agent`] waits for it to wind down before touching the camera again. It also ends the
 /// camera retries and any wait for the server, so nothing brings a stopped agent back.
 pub fn stop_agent() {
+    // The capture path stops converting as soon as the run is asked to stop, rather than when it
+    // has finished winding down; the run clears the sink again when it ends.
+    scwc_core::preview::set_preview_sink(None);
     let mut slot = AGENT.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(shutdown) = slot.shutdown.take() {
         let _ = shutdown.send(true);
@@ -506,6 +543,78 @@ pub fn agent_events(sink: StreamSink<AgentEvent>) {
         .push(sink);
 }
 
+/// Subscribes to live preview frames; the returned Dart stream is the camera picture.
+///
+/// Frames arrive only while an agent runs and a target size is set. Only frames captured after the
+/// call are delivered, one is dropped rather than queued while Dart is still decoding the previous
+/// one, and a subscription that Dart cancelled is dropped at the next frame.
+pub fn preview_stream(sink: StreamSink<PreviewFrame>) {
+    PREVIEW_SUBSCRIBERS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(sink);
+}
+
+/// Sets the size the preview frames are scaled to before they reach Dart.
+///
+/// The UI sends the pixel size of its preview area — the logical size of the area times the device
+/// pixel ratio — on every layout change, and `0x0` while it shows no preview. The capture path
+/// scales every frame aspect-locked to fit inside that box, so no letterboxing ever reaches the
+/// UI: it centres what it gets.
+#[frb(sync)]
+pub fn set_preview_target_size(width: u32, height: u32) {
+    scwc_core::preview::set_preview_target_size(width, height);
+}
+
+/// Hands preview frames to every live Dart stream, until the capture path drops its sender.
+///
+/// That sender is dropped when the run ends, which is what ends this task.
+async fn forward_preview_frames(mut frames: UnboundedReceiver<CorePreviewFrame>) {
+    while let Some(frame) = frames.recv().await {
+        let CorePreviewFrame {
+            rgba,
+            width,
+            height,
+        } = frame;
+        // The pixels move into the frame Dart receives; nothing here copies them.
+        emit_preview(PreviewFrame {
+            rgba,
+            width,
+            height,
+        });
+    }
+}
+
+/// Hands `frame` to every live preview stream.
+///
+/// A sink whose Dart subscription is gone rejects the frame, and that is how dead subscribers are
+/// found and dropped. The last sink gets the frame itself and the earlier ones a copy, so the
+/// usual single viewer never copies the pixels.
+fn emit_preview(frame: PreviewFrame) {
+    let mut subscribers = PREVIEW_SUBSCRIBERS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if subscribers.is_empty() {
+        return;
+    }
+
+    let last = subscribers.len() - 1;
+    let mut shared = Some(frame);
+    let mut live = Vec::with_capacity(subscribers.len());
+    for (index, sink) in subscribers.drain(..).enumerate() {
+        let delivered = if index == last {
+            shared.take()
+        } else {
+            shared.clone()
+        };
+        let Some(frame) = delivered else { break };
+        if sink.add(frame).is_ok() {
+            live.push(sink);
+        }
+    }
+    *subscribers = live;
+}
+
 /// The template's demo API, kept while the UI lane replaces the demo screen.
 pub mod simple;
 
@@ -541,6 +650,9 @@ static RUNTIME: LazyLock<Result<Runtime, String>> =
 
 /// Dart streams subscribed to [`agent_events`].
 static SUBSCRIBERS: Mutex<Vec<StreamSink<AgentEvent>>> = Mutex::new(Vec::new());
+
+/// Dart streams subscribed to [`preview_stream`].
+static PREVIEW_SUBSCRIBERS: Mutex<Vec<StreamSink<PreviewFrame>>> = Mutex::new(Vec::new());
 
 /// Guards the one-time installation of the `tracing` subscriber.
 static LOGGING: Once = Once::new();
