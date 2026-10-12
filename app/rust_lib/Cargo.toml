@@ -15,5 +15,16 @@ scwc-capture = { path = "../../crates/capture" }
 scwc-protocol = { path = "../../crates/protocol" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 
+# `log` is used by the panic hook on every platform, so it belongs here rather than in the
+# Android-only block; only the logcat backend itself is Android-specific. `tracing`'s `log`
+# feature (enabled workspace-wide) is what mirrors the core's events into `log` records.
+log = "0.4"
+
+# The core logs through `tracing`; without a `log` backend in this process its diagnostics —
+# registration failures, retry delays — never leave the library, and an Android app's standard
+# streams do not reach logcat either.
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }

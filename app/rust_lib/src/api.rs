@@ -132,6 +132,7 @@ pub fn list_cameras() -> Result<Vec<CameraInfoDto>, String> {
 /// unsupported codec name, or no camera at all. Everything that can fail later — the camera not
 /// opening, the server rejecting the token — arrives as [`AgentEvent::Error`].
 pub async fn start_agent(config: AgentConfig) -> Result<(), String> {
+    crate::init_logging();
     let codec = parse_codec(&config.codec)?;
     let resolution = format!("{}x{}", config.width, config.height);
     let (supported_resolutions, supported_framerates) =
