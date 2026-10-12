@@ -11,6 +11,8 @@
 //! - `session`: attach to `GET /ws/device/{ticket}` and pump the socket.
 //! - `control`: parse server envelopes, keep the per-session device state, answer `ack`s.
 //! - `media`: pull frames from the [`FrameSource`], queue them with a drop policy.
+//! - `params`: remember the capture parameters a switch applied, in memory and on disk.
+//! - `command`: the requests an embedding application sends while the client runs.
 //! - [`run`]: the supervisor that ties all of the above into a reconnect loop.
 //!
 //! # Quick start
@@ -39,6 +41,19 @@
 //!   without an `id` are handled but not answered.
 //! - Frames are sent only for a stream that a `start_recording` command announced, tagged
 //!   with a per-stream `seq` starting at `0` and the capture time of each frame.
+//! - A parameter switch (`switch_camera`, or the codec of a `start_recording`) is answered as
+//!   soon as it is accepted; while a stream is active it reaches the capture pipeline when
+//!   that stream ends, so a recording keeps the parameters it started with.
+//! - The same switch travels the same path when the embedding application asks for it through
+//!   [`ClientConfig::commands`], which is also how an application moves the client onto another
+//!   server: a [`UiCommand::Reconnect`] registers again with the new credentials, at once while
+//!   no stream is live and once the live one has ended otherwise, so a recording survives the
+//!   request.
+//! - Every parameter set that reaches the capture pipeline is reported as
+//!   [`CoreEvent::ParametersApplied`] and persisted; a request that had to wait is reported as
+//!   [`CoreEvent::Notice`].
+//! - With [`ClientConfig::state_path`] set, the parameters the client was last switched to
+//!   outlive the process and take precedence over the announced defaults at the next start.
 //! - Media never blocks the frame source except while a keyframe waits for queue space;
 //!   delta frames are discarded until the next keyframe when the queue overflows.
 //! - Any close re-registers from scratch behind exponential backoff (1s, doubling, capped
@@ -48,17 +63,22 @@
 #![warn(missing_docs)]
 
 pub mod clock;
+mod command;
 mod config;
 mod control;
 mod error;
+mod events;
 mod media;
+mod params;
 mod register;
 mod session;
 mod supervisor;
 
-pub use config::ClientConfig;
+pub use command::{SwitchParams, UiCommand};
+pub use config::{ClientConfig, ServerConfig};
 pub use error::{CoreError, Result, SourceError};
-pub use media::{EncodedFrame, FrameSource, MEDIA_QUEUE_CAPACITY};
+pub use events::CoreEvent;
+pub use media::{EncodedFrame, FrameSource, MEDIA_QUEUE_CAPACITY, default_bitrate_kbps};
 pub use supervisor::run;
 
 pub use scwc_protocol::CameraRegistration;
