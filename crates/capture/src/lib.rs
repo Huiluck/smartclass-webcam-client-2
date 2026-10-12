@@ -26,12 +26,12 @@
 //! - **Android**: the Camera2 NDK for capture and `AMediaCodec` for encoding, both reached
 //!   through hand-written FFI like the Linux backend, so no shim is compiled either.
 //!   Enumeration reports each camera's real capability matrix, and the media path carries
-//!   `switch_camera` rebuilds, stills through a JPEG reader and a thermal encoder step-down.
-//!   Streaming (up to 4K60, with the frame cadence verified while media flows), `switch_camera`
-//!   and `take_photo` are verified on hardware through the Flutter shell; a sustained
-//!   wall-clock rate is not — the run was minutes, not a soak. Thermal step-down is out of
-//!   scope: the protocol carries no thermal state, so what the plan calls for has nothing to
-//!   trigger it. The `CAMERA` permission is held
+//!   `switch_camera` rebuilds and stills through a JPEG reader. Streaming (up to 4K60, with
+//!   the frame cadence verified while media flows), `switch_camera` and `take_photo` are
+//!   verified on hardware through the Flutter shell; a sustained wall-clock rate is not — the
+//!   run was minutes, not a soak. Thermal step-down is not built: the plan asks for it,
+//!   nothing in this backend measures heat, and the configured bitrate stands until an
+//!   operator changes it. The `CAMERA` permission is held
 //!   per process on this platform: an installed app gets it from the user, while a native
 //!   binary run from `adb shell` is at the mercy of the vendor's own policy, which on one
 //!   vendor's devices means its camera HAL aborts on such a client's first request (the
@@ -56,9 +56,10 @@
 //! - **Orientation**: frames are handed on as the sensor produces them. Nothing in this
 //!   crate rotates them to the interface orientation — that is the app layer's job, since
 //!   the protocol carries no rotation field to describe it in.
-//! - **Thermal pressure**: state transitions are logged, and the protocol's answer to heat
-//!   is an encoder bitrate reduction (never a change of resolution or frame rate), which the
-//!   core owns.
+//! - **Thermal pressure**: state transitions are logged, and that is all — no backend in this
+//!   client retargets the encoder, so the configured bitrate stands until an operator changes
+//!   it (never a change of resolution or frame rate, which the protocol reserves for
+//!   `switch_camera`).
 //! - **Interruptions**: a session that a phone call or another client takes away is logged
 //!   and restarted once the interruption ends.
 //!

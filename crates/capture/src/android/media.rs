@@ -193,22 +193,13 @@ const COLOR_FORMAT_SURFACE: i32 = 0x7F00_0789;
 /// time, and the server's own consumers assume no longer a wait than this.
 const I_FRAME_INTERVAL_SECONDS: u32 = 2;
 
-/// `MediaFormat.KEY_VIDEO_BITRATE`: the key `AMediaCodec_setParameters` reads a new target
-/// bitrate from.
-///
-/// Spelled as a literal rather than read through the NDK's `AMEDIACODEC_KEY_VIDEO_BITRATE`
-/// symbol, unlike the keys this file takes from `libmediandk.so` itself: that symbol only
-/// exists from API 31, and the loader resolves every symbol this library references *before*
-/// `main` runs — `BIND_NOW`, as the Android toolchain links it — so referencing a symbol from
-/// a newer API than the oldest supported device would keep the whole library from loading
-/// there. The value is the Java API's documented key string, which the platform has matched
-/// since long before the symbol was exported.
-const KEY_VIDEO_BITRATE: &CStr = c"video-bitrate";
-
 /// `MediaFormat.KEY_CSD_0`: the first codec-specific-data blob of the output format.
 ///
-/// Spelled out for the same reason as [`KEY_VIDEO_BITRATE`]: the NDK only exports this key from
-/// API 28, while the devices this client targets include Android 8.
+/// Spelled as a literal rather than read through the NDK symbol, which only exists from API 28,
+/// while the devices this client targets include Android 8. The loader resolves every symbol
+/// this library references *before* `main` runs — `BIND_NOW`, as the Android toolchain links it
+/// — so a symbol from a newer API than the oldest supported device would keep the whole library
+/// from loading there. The value is the Java API's documented key string.
 const KEY_CSD_0: &CStr = c"csd-0";
 
 /// `MediaFormat.KEY_CSD_1`: the second codec-specific-data blob of the output format.
@@ -256,10 +247,6 @@ unsafe extern "C" {
     fn AMediaCodec_releaseOutputBuffer(codec: *mut AMediaCodec, index: usize, render: bool)
     -> c_int;
     fn AMediaCodec_getOutputFormat(codec: *mut AMediaCodec) -> *mut AMediaFormat;
-    fn AMediaCodec_setParameters(
-        codec: *mut AMediaCodec,
-        params: *const AMediaFormat,
-    ) -> c_int;
 
     fn AMediaFormat_new() -> *mut AMediaFormat;
     fn AMediaFormat_delete(format: *mut AMediaFormat) -> c_int;
@@ -553,40 +540,6 @@ impl Encoder {
     /// pointer stays good even if the codec is torn down first.
     pub(crate) fn input_surface(&self) -> *mut ANativeWindow {
         self.input_surface
-    }
-
-    /// Retargets the running codec's bitrate, which is the protocol's answer to thermal
-    /// pressure: `resolution` and `fps` may not move without an operator `switch_camera`, so
-    /// heat is paid for in bitrate alone.
-    ///
-    /// The platform takes the new target as a parameter on a running codec and warns that such
-    /// a change "may silently fail to apply"; a status the call reports is therefore treated as
-    /// a failure the caller may retry, while a success means the codec accepted the value, not
-    /// that the next GOP is already smaller.
-    pub(crate) fn set_bitrate(&mut self, bitrate_kbps: u32) -> Result<(), CaptureError> {
-        if self.codec.is_null() || !self.started {
-            return Err(CaptureError::Os(
-                "the media codec is not running".to_owned(),
-            ));
-        }
-        let Some(params) = MediaFormat::new() else {
-            return Err(CaptureError::Os(
-                "AMediaFormat_new returned null".to_owned(),
-            ));
-        };
-        // As at configure time, the platform takes bits per second in an `int32`, so an
-        // oversized request is clamped rather than wrapped into a negative bitrate.
-        let bitrate = bitrate_kbps.saturating_mul(1000).min(i32::MAX as u32) as i32;
-        params.set_int32_str(KEY_VIDEO_BITRATE, bitrate);
-
-        // SAFETY: the codec is live and started, which is the state the header requires for
-        // this call, and `params` outlives it.
-        let status = unsafe { AMediaCodec_setParameters(self.codec, params.as_ptr()) };
-        if status != STATUS_OK {
-            return Err(status_error("setting the media codec's bitrate", status));
-        }
-        info!(bitrate, "the encoder took a new target bitrate");
-        Ok(())
     }
 
     /// Moves the codec to Executing (`AMediaCodec_start`).
@@ -912,15 +865,6 @@ impl MediaFormat {
         // SAFETY: the format is live, and `name` is an `AMEDIAFORMAT_KEY_*` extern static read
         // for the value the loader put there before `main`, which the platform never changes.
         unsafe { AMediaFormat_setInt32(self.ptr, key(name), value) };
-    }
-
-    /// Stores an integer entry under a key spelled as a C string.
-    ///
-    /// For the keys this crate states itself rather than reads from the platform (see
-    /// [`Encoder::set_bitrate`]).
-    fn set_int32_str(&self, name: &CStr, value: i32) {
-        // SAFETY: the format is live, and `name` is a NUL-terminated key that outlives the call.
-        unsafe { AMediaFormat_setInt32(self.ptr, name.as_ptr(), value) };
     }
 
     /// Reads a byte-array entry, or an empty vector when it is absent or of another type.

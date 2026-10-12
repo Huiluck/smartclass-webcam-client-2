@@ -23,9 +23,11 @@
 //! straight into its input surface, a capture thread moves encoded access units to the core,
 //! `switch_camera` tears the stream down and builds it again on the same open device, and
 //! `take_photo` submits a one-shot still request to a JPEG reader riding in the same session.
-//! Thermal pressure is answered with an encoder bitrate step-down and nothing else, since the
-//! protocol lets a device move neither `resolution` nor `fps` without an operator command (see
-//! [`thermal`]).
+//!
+//! The plan's thermal policy — throttling the encoder under thermal pressure — is deliberately
+//! not implemented here: the server reports no thermal state of its own, nothing in this
+//! backend measures it, and heat leaves the configured bitrate alone until an operator changes
+//! it.
 //!
 //! Most of that wiring has since run on hardware — a vivo V2405A (MediaTek, Android 16)
 //! through the Flutter shell, which is the context a device client actually runs in:
@@ -42,9 +44,6 @@
 //!   flowing afterwards.
 //! - **`take_photo`**: a still came back as a 210 KB `image/jpeg` carrying the `request_id` of
 //!   the command that asked for it.
-//! - **Thermal step-down**: out of scope. The plan's thermal policy (bitrate step-down on
-//!   pressure) is not being built — the protocol has no field for a device to report thermal
-//!   state, so a step-down would be invisible to the server and untestable from it.
 //!
 //! # Why a run from `adb shell` says nothing about this backend
 //!
@@ -63,19 +62,17 @@ mod media;
 mod native_window;
 mod session;
 mod still;
-mod thermal;
 
 use std::ffi::c_void;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use scwc_protocol::Codec;
 use tracing::{debug, error, info, warn};
 
 use self::camera2::{ACameraDevice_StateCallbacks, LensFacing, Manager, Metadata};
 use self::still::StillCapture;
-use self::thermal::{ThermalMonitor, ThermalStatus};
 use crate::camera_matrix::{fps_by_resolution, fps_ranges};
 use crate::error::CaptureError;
 use crate::source::{FrameCallback, JpegCallback};
@@ -340,12 +337,6 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// it waits — can be held away from the video stream.
 const STILL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How often the capture thread asks the platform how hot the device is.
-///
-/// The reading is a binder call into the thermal service, so it is polled at a rate that is
-/// irrelevant next to the encoder's own load, not on every loop iteration.
-const THERMAL_POLL_INTERVAL: Duration = Duration::from_secs(2);
-
 /// What the capture thread needs to build the pipeline.
 struct Setup {
     /// Capture and encoder parameters.
@@ -500,7 +491,6 @@ fn pump(setup: Setup, requests: Receiver<Command>, ready: SyncSender<Result<(), 
         return;
     }
 
-    let mut next_thermal_poll = Instant::now() + THERMAL_POLL_INTERVAL;
     loop {
         match requests.try_recv() {
             Ok(Command::Stop) => break,
@@ -529,11 +519,6 @@ fn pump(setup: Setup, requests: Receiver<Command>, ready: SyncSender<Result<(), 
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => break,
-        }
-
-        if Instant::now() >= next_thermal_poll {
-            next_thermal_poll = Instant::now() + THERMAL_POLL_INTERVAL;
-            pipeline.poll_thermal();
         }
 
         // A pipeline whose last rebuild failed has nothing left to pull frames from; leaving
@@ -653,10 +638,6 @@ struct Pipeline {
     manager: Manager,
     /// The camera's characteristics, kept for the capability check on reconfiguration.
     characteristics: Metadata,
-    /// The platform's thermal service, when this device has one.
-    thermal: Option<ThermalMonitor>,
-    /// The thermal status the encoder's bitrate currently reflects.
-    thermal_status: ThermalStatus,
 }
 
 impl Pipeline {
@@ -697,34 +678,14 @@ impl Pipeline {
         let mut device = manager.open(&camera_id, &mut callbacks)?;
         let stream = Stream::start(&mut device, cfg)?;
 
-        // The thermal service is API 30 and may be absent; without it the encoder simply never
-        // throttles, which is the behaviour of every device that predates the service.
-        let thermal = match ThermalMonitor::start() {
-            Some(monitor) => {
-                debug!(status = monitor.status().name(), "thermal monitoring is available");
-                Some(monitor)
-            }
-            None => {
-                debug!(
-                    "no thermal service on this device; the encoder bitrate will not follow heat"
-                );
-                None
-            }
-        };
-
-        let mut pipeline = Self {
+        let pipeline = Self {
             stream: Some(stream),
             cfg: cfg.clone(),
             device,
             callbacks,
             manager,
             characteristics,
-            thermal,
-            thermal_status: ThermalStatus::Nominal,
         };
-        // A device that is already hot starts stepped down rather than waiting for the first
-        // two-second poll to notice.
-        pipeline.poll_thermal();
 
         info!(
             camera = %camera_id,
@@ -757,7 +718,6 @@ impl Pipeline {
             Ok(stream) => {
                 self.stream = Some(stream);
                 self.cfg = cfg.clone();
-                self.apply_thermal_bitrate();
                 info!(
                     width = cfg.width,
                     height = cfg.height,
@@ -773,7 +733,6 @@ impl Pipeline {
                 match Stream::start(&mut self.device, &previous) {
                     Ok(stream) => {
                         self.stream = Some(stream);
-                        self.apply_thermal_bitrate();
                     }
                     Err(restore) => {
                         error!(%restore, "the previous Android capture parameters no longer work either");
@@ -810,51 +769,6 @@ impl Pipeline {
         unsafe { cb(user, jpeg.as_ptr(), jpeg.len()) };
         debug!(bytes = jpeg.len(), "still delivered");
         Ok(())
-    }
-
-    /// Reads the platform's thermal status and steps the encoder's bitrate when it moves.
-    fn poll_thermal(&mut self) {
-        let status = match self.thermal.as_ref() {
-            Some(monitor) => monitor.status(),
-            None => return,
-        };
-        if status == self.thermal_status {
-            return;
-        }
-        info!(
-            from = self.thermal_status.name(),
-            to = status.name(),
-            "the device's thermal status changed"
-        );
-        self.thermal_status = status;
-        self.apply_thermal_bitrate();
-    }
-
-    /// Sets the running encoder's bitrate to the configured rate scaled by the thermal status.
-    ///
-    /// This is the whole thermal policy the protocol leaves a device: `resolution` and `fps`
-    /// may not change without an operator `switch_camera`, so heat is paid for in bitrate alone,
-    /// and the rate returns to the configured one as soon as the device cools.
-    fn apply_thermal_bitrate(&mut self) {
-        let percent = self.thermal_status.bitrate_percent();
-        let status = self.thermal_status;
-        let Some(stream) = self.stream.as_mut() else {
-            return;
-        };
-        let target = self.cfg.bitrate_kbps.saturating_mul(percent) / 100;
-        match stream.encoder.set_bitrate(target) {
-            Ok(()) => info!(
-                bitrate_kbps = target,
-                percent,
-                status = status.name(),
-                "encoder bitrate set for the thermal status"
-            ),
-            Err(error) => warn!(
-                %error,
-                status = status.name(),
-                "the encoder refused the thermal bitrate change"
-            ),
-        }
     }
 }
 
