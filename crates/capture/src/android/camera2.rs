@@ -682,6 +682,13 @@ pub(crate) type RequestTemplate = c_int;
 /// recording-grade post-processing, which is what a device client wants.
 pub(crate) const TEMPLATE_RECORD: RequestTemplate = 3;
 
+/// `TEMPLATE_STILL_CAPTURE`: the preset for one high-quality still.
+///
+/// Used for the photo channel's one-shot request: it asks the camera to settle exposure for
+/// the still, which is exactly the difference between this and the recording template the
+/// repeating request carries.
+pub(crate) const TEMPLATE_STILL_CAPTURE: RequestTemplate = 2;
+
 /// `ACameraCaptureSession_stateCallback`.
 pub(crate) type SessionStateCallback =
     unsafe extern "C" fn(context: *mut c_void, session: *mut ACameraCaptureSession);
@@ -749,6 +756,13 @@ unsafe extern "C" {
     fn ACaptureRequest_free(request: *mut ACaptureRequest);
 
     fn ACameraCaptureSession_setRepeatingRequest(
+        session: *mut ACameraCaptureSession,
+        callbacks: *mut c_void,
+        num_requests: c_int,
+        requests: *mut *mut ACaptureRequest,
+        sequence_id: *mut c_int,
+    ) -> c_int;
+    fn ACameraCaptureSession_capture(
         session: *mut ACameraCaptureSession,
         callbacks: *mut c_void,
         num_requests: c_int,
@@ -962,4 +976,31 @@ pub(crate) unsafe fn stop_repeating(session: *mut ACameraCaptureSession) {
 pub(crate) unsafe fn capture_session_close(session: *mut ACameraCaptureSession) {
     // SAFETY: the caller guarantees the pointer came from `capture_session_create`.
     unsafe { ACameraCaptureSession_close(session) };
+}
+
+/// Submits `requests` as a one-shot burst, which is how the photo channel asks for a still.
+///
+/// # Safety
+///
+/// `session` must be live, and each request must stay valid until the session stops using it;
+/// every target a request names has to be one of the session's own outputs.
+pub(crate) unsafe fn capture_once(
+    session: *mut ACameraCaptureSession,
+    requests: &mut [*mut ACaptureRequest],
+) -> Result<(), CaptureError> {
+    // SAFETY: the caller guarantees the session and the requests are live. No capture
+    // callbacks are registered: the client reads the still out of its own reader rather than
+    // out of the framework's result metadata.
+    let status = unsafe {
+        ACameraCaptureSession_capture(
+            session,
+            ptr::null_mut(),
+            requests.len() as c_int,
+            requests.as_mut_ptr(),
+            ptr::null_mut(),
+        )
+    };
+    (status == ACAMERA_OK)
+        .then_some(())
+        .ok_or_else(|| status_error("submitting a still capture", status))
 }

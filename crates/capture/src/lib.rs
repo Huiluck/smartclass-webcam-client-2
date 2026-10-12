@@ -25,10 +25,12 @@
 //!   behaviours that hardware testing still has to confirm.
 //! - **Android**: the Camera2 NDK for capture and `AMediaCodec` for encoding, both reached
 //!   through hand-written FFI like the Linux backend, so no shim is compiled either.
-//!   Enumeration reports each camera's real capability matrix; the capture session and the
-//!   encoder are still being built (see the `android` module for the exact state). The
-//!   `CAMERA` permission is held per process on this platform, so a run from `adb shell`
-//!   is refused where an installed app succeeds.
+//!   Enumeration reports each camera's real capability matrix, and the media path carries
+//!   `switch_camera` rebuilds, stills through a JPEG reader and a thermal encoder step-down;
+//!   the `android` module records exactly what has and has not been proven on hardware. The
+//!   `CAMERA` permission is held per process on this platform, so a run from `adb shell` is
+//!   at the mercy of the vendor's own policy where an installed app gets the permission from
+//!   the user.
 //! - **Everything else**: [`enumerate_cameras`] and [`open`] fail with
 //!   [`CaptureError::Os`]; the crate still compiles so that the rest of the workspace can
 //!   be built and tested on any host.

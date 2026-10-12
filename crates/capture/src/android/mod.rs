@@ -18,30 +18,43 @@
 //!
 //! # State of this backend
 //!
-//! Capture and encode are wired: enumeration reads the camera's own capability matrix, opening
-//! a camera brings up a hardware encoder with the camera writing straight into its input
-//! surface, and a capture thread moves encoded access units to the core. Enumeration and the
-//! device open have run on a phone (`adb shell`, no app); the media path has not yet — it is
-//! written against the NDK headers and compiles, and is the next thing to prove on hardware.
+//! Everything the core can ask of a camera is wired: enumeration reads the camera's own
+//! capability matrix, opening a camera brings up a hardware encoder with the camera writing
+//! straight into its input surface, a capture thread moves encoded access units to the core,
+//! `switch_camera` tears the stream down and builds it again on the same open device, and
+//! `take_photo` submits a one-shot still request to a JPEG reader riding in the same session.
+//! Thermal pressure is answered with an encoder bitrate step-down and nothing else, since the
+//! protocol lets a device move neither `resolution` nor `fps` without an operator command (see
+//! [`thermal`]).
 //!
-//! Two parts are still refused rather than faked: `switch_camera` reconfiguration, which has to
-//! tear the session and the encoder down and build them again, and still capture for
-//! `take_photo`, which needs a second output and a JPEG reader.
+//! What has *not* happened is a frame delivered on hardware. The phone this backend was last
+//! exercised against (a vivo V2405A, MediaTek) aborts its own camera HAL — `SIGABRT` inside
+//! `processCaptureRequest`, a mutex used after destruction in the vendor's `libvcf_session.so`
+//! — on the first request from a native client started through `adb shell`, at every geometry,
+//! template and output tried, while the vendor's own camera app streams from the same device
+//! without trouble. The media path is therefore written against the NDK headers and compiles
+//! and links for `aarch64-linux-android`, and what remains to be proven on hardware is the
+//! same path from inside an installed app, whose client identity this vendor framework does
+//! recognize.
 
 mod camera2;
 mod media;
 mod native_window;
 mod session;
+mod still;
+mod thermal;
 
 use std::ffi::c_void;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use scwc_protocol::Codec;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use self::camera2::{ACameraDevice_StateCallbacks, LensFacing, Manager, Metadata};
+use self::still::StillCapture;
+use self::thermal::{ThermalMonitor, ThermalStatus};
 use crate::camera_matrix::{fps_by_resolution, fps_ranges};
 use crate::error::CaptureError;
 use crate::source::{FrameCallback, JpegCallback};
@@ -254,7 +267,6 @@ unsafe impl Send for Handle {}
 /// One request from the owning thread to the capture thread.
 enum Command {
     /// Rebuild the pipeline with these capture and encoder parameters.
-    #[allow(dead_code)]
     SetParameters {
         /// Requested picture width in pixels.
         width: u32,
@@ -266,6 +278,15 @@ enum Command {
         codec: Codec,
         /// Target bitrate in kilobits per second.
         bitrate_kbps: u32,
+        /// Where the outcome is reported.
+        reply: SyncSender<Result<(), CaptureError>>,
+    },
+    /// Capture one still and deliver it through this callback.
+    TakePhoto {
+        /// The backend entry point to deliver the still through.
+        cb: JpegCallback,
+        /// The opaque pointer the callback is invoked with.
+        user: SendPtr,
         /// Where the outcome is reported.
         reply: SyncSender<Result<(), CaptureError>>,
     },
@@ -289,6 +310,20 @@ const DEQUEUE_TIMEOUT_US: i64 = 50_000;
 
 /// How long [`Handle::open`] waits for the capture thread to bring the pipeline up.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a still capture may take before the photo path gives up.
+///
+/// The one-shot request has to work its way through the camera's own settling (auto-exposure
+/// and focus for the still) before the JPEG is written; five seconds is far past what a phone
+/// needs and still bounds how long the capture thread — which stops draining the encoder while
+/// it waits — can be held away from the video stream.
+const STILL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often the capture thread asks the platform how hot the device is.
+///
+/// The reading is a binder call into the thermal service, so it is polled at a rate that is
+/// irrelevant next to the encoder's own load, not on every loop iteration.
+const THERMAL_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// What the capture thread needs to build the pipeline.
 struct Setup {
@@ -350,32 +385,59 @@ impl Handle {
 
     /// Reconfigures the pipeline for a `switch_camera` command.
     ///
-    /// Rebuilding means tearing the session and the encoder down and building them again on the
-    /// same device, which is what `switch_camera` needs when it changes resolution, frame rate
-    /// or codec. It is the next piece of this backend; until it lands the server is told so
-    /// rather than being left to believe the camera changed.
+    /// The session and the encoder cannot change geometry while they run, so the capture thread
+    /// tears the stream down and builds a new one on the same open device. Blocks until that
+    /// has happened — at most one frame — and reports the camera's answer, which is what the
+    /// core turns into `ack {ok: true/false}`.
     pub(crate) fn set_parameters(
         &self,
-        _width: u32,
-        _height: u32,
-        _fps: u32,
-        _codec: Codec,
-        _bitrate_kbps: u32,
+        width: u32,
+        height: u32,
+        fps: u32,
+        codec: Codec,
+        bitrate_kbps: u32,
     ) -> Result<(), CaptureError> {
-        Err(CaptureError::Os(
-            "reconfiguring an Android capture is not implemented yet".to_owned(),
-        ))
+        let (reply, outcome) = mpsc::sync_channel(1);
+        self.send(Command::SetParameters {
+            width,
+            height,
+            fps,
+            codec,
+            bitrate_kbps,
+            reply,
+        });
+        outcome.recv().unwrap_or(Err(CaptureError::ChannelClosed))
     }
 
-    /// Captures one still.
+    /// Captures one still, delivered through `jpeg_cb` before this function returns.
+    ///
+    /// Blocks for the camera's still sequence, which the core allows: it reconfigures and takes
+    /// photos at frame boundaries anyway. A photo the camera cannot produce — no JPEG output in
+    /// this session — comes back as [`CaptureError::UnsupportedParameters`].
     pub(crate) fn take_photo(
         &self,
-        _jpeg_cb: JpegCallback,
-        _user: *mut c_void,
+        jpeg_cb: JpegCallback,
+        user: *mut c_void,
     ) -> Result<(), CaptureError> {
-        Err(CaptureError::Os(
-            "Android still capture is not implemented yet".to_owned(),
-        ))
+        let (reply, outcome) = mpsc::sync_channel(1);
+        self.send(Command::TakePhoto {
+            cb: jpeg_cb,
+            user: SendPtr(user),
+            reply,
+        });
+        outcome.recv().unwrap_or(Err(CaptureError::ChannelClosed))
+    }
+
+    /// Hands a command to the capture thread.
+    ///
+    /// Nothing wakes the thread: it looks at its channel every
+    /// [`DEQUEUE_TIMEOUT_US`](DEQUEUE_TIMEOUT_US) microseconds while waiting for the encoder,
+    /// so a command is picked up within that, and the platform keeps every call on the one
+    /// thread that owns the objects.
+    fn send(&self, command: Command) {
+        if self.commands.send(command).is_err() {
+            debug!("the capture thread is gone; the command is dropped with it");
+        }
     }
 
     /// Stops capturing and releases the camera.
@@ -384,7 +446,7 @@ impl Handle {
     /// framework's references valid.
     pub(crate) fn close(&mut self) {
         // A send failure means the thread already left, which is not an error here.
-        let _ = self.commands.send(Command::Stop);
+        self.send(Command::Stop);
         if let Some(pump) = self.pump.take() {
             let _ = pump.join();
         }
@@ -417,22 +479,50 @@ fn pump(setup: Setup, requests: Receiver<Command>, ready: SyncSender<Result<(), 
         return;
     }
 
+    let mut next_thermal_poll = Instant::now() + THERMAL_POLL_INTERVAL;
     loop {
         match requests.try_recv() {
             Ok(Command::Stop) => break,
-            Ok(Command::SetParameters { reply, .. }) => {
-                // Unreachable while `Handle::set_parameters` refuses, and honest if it stops
-                // refusing before the rebuild exists: better a reported failure than a camera
-                // that silently keeps its old geometry.
-                let _ = reply.send(Err(CaptureError::Os(
-                    "rebuilding an Android capture is not implemented yet".to_owned(),
-                )));
+            Ok(Command::SetParameters {
+                width,
+                height,
+                fps,
+                codec,
+                bitrate_kbps,
+                reply,
+            }) => {
+                let cfg = CaptureConfig {
+                    camera_id: pipeline.cfg.camera_id.clone(),
+                    width,
+                    height,
+                    fps,
+                    codec,
+                    bitrate_kbps,
+                };
+                let outcome = pipeline.rebuild(&cfg);
+                let _ = reply.send(outcome);
+            }
+            Ok(Command::TakePhoto { cb, user, reply }) => {
+                let outcome = pipeline.take_photo(cb, user.0);
+                let _ = reply.send(outcome);
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => break,
         }
 
-        match pipeline.encoder.next_access_unit(DEQUEUE_TIMEOUT_US) {
+        if Instant::now() >= next_thermal_poll {
+            next_thermal_poll = Instant::now() + THERMAL_POLL_INTERVAL;
+            pipeline.poll_thermal();
+        }
+
+        // A pipeline whose last rebuild failed has nothing left to pull frames from; leaving
+        // the loop closes the command channel, which is how the source learns capture stopped.
+        let Some(stream) = pipeline.stream.as_mut() else {
+            warn!("the Android capture stream is down; the client will report no more frames");
+            break;
+        };
+
+        match stream.encoder.next_access_unit(DEQUEUE_TIMEOUT_US) {
             Ok(Some(unit)) => {
                 // SAFETY: `user` is the `CallbackState` box `source.rs` keeps alive for as long
                 // as this backend, and the bytes live until `unit` is dropped.
@@ -457,26 +547,80 @@ fn pump(setup: Setup, requests: Receiver<Command>, ready: SyncSender<Result<(), 
     debug!("leaving the Android capture thread");
 }
 
-/// The camera-side objects the capture thread owns, in teardown order.
+/// One capture stream: the session, the encoder it feeds, and the still reader alongside them.
 ///
-/// Field order is the drop order, and it is not arbitrary: the session has to stop feeding the
-/// encoder before the encoder goes away, the encoder has to release its surface before the
-/// device that drives it is closed, and the device has to outlive the session built on it. The
-/// manager and the callbacks outlive everything, because the framework keeps pointers to both
-/// for as long as the device is open.
-///
-/// Most of these fields are never read: they are held for what their `Drop` does, in the order
-/// above. The ones that are marked are the ones nothing else touches even by name.
-struct Pipeline {
+/// Field order is the drop order: the session has to stop feeding both surfaces before either
+/// goes away, the encoder gives its input surface back when it stops, and the still reader owns
+/// the window the session's still output pointed at, so it outlives the session as well.
+struct Stream {
     /// The running capture session.
     #[allow(dead_code)]
     session: session::Session,
     /// The hardware encoder the session fills.
-    ///
-    /// Owns the input surface's reference, which it releases when it stops; the session only
-    /// borrows the pointer, which is why the session is declared above and stops feeding the
-    /// surface before the encoder gives it back.
     encoder: media::Encoder,
+    /// The JPEG reader `take_photo` reads from, when the camera accepted one.
+    still: Option<StillCapture>,
+}
+
+impl Stream {
+    /// Brings up the chain: encoder, still reader, session.
+    fn start(device: &mut camera2::Device, cfg: &CaptureConfig) -> Result<Self, CaptureError> {
+        // The encoder first: the session needs the surface its codec was configured with, and
+        // starting the codec before the camera writes into it is what keeps the first frames
+        // from arriving at a codec that is not running yet.
+        let mut encoder = media::Encoder::create(
+            cfg.codec,
+            cfg.width,
+            cfg.height,
+            cfg.fps,
+            cfg.bitrate_kbps,
+        )?;
+        encoder.start()?;
+
+        // The still output is best-effort: a device that cannot bring up a JPEG reader loses
+        // `take_photo`, not the stream, and so does a camera that refuses to carry a still
+        // output beside the video one (the stream combination is a device property).
+        let mut still = match StillCapture::new(cfg.width, cfg.height) {
+            Ok(still) => Some(still),
+            Err(error) => {
+                warn!(%error, "no still output for this Android stream; take_photo will refuse");
+                None
+            }
+        };
+        let still_window = still.as_ref().map(StillCapture::window);
+        let session = match session::Session::start(
+            device,
+            encoder.input_surface(),
+            still_window,
+            cfg.fps,
+        ) {
+            Ok(session) => session,
+            Err(error) if still_window.is_some() => {
+                warn!(%error, "the camera refused the still output; rebuilding the session without it");
+                still = None;
+                session::Session::start(device, encoder.input_surface(), None, cfg.fps)?
+            }
+            Err(error) => return Err(error),
+        };
+
+        Ok(Self {
+            session,
+            encoder,
+            still,
+        })
+    }
+}
+
+/// The camera-side objects the capture thread owns, and the stream running on them.
+///
+/// Field order is the drop order, and it is not arbitrary: the stream has to stop before the
+/// device that drives it is closed, and the manager and the callbacks outlive everything,
+/// because the framework keeps pointers to both for as long as the device is open.
+struct Pipeline {
+    /// The running stream, or `None` while a rebuild is in flight or after one failed.
+    stream: Option<Stream>,
+    /// The parameters the running stream was configured with.
+    cfg: CaptureConfig,
     /// The opened camera.
     #[allow(dead_code)]
     device: camera2::Device,
@@ -486,9 +630,12 @@ struct Pipeline {
     /// The manager the device was opened through.
     #[allow(dead_code)]
     manager: Manager,
-    /// The camera's characteristics, kept for the geometry the encoder was configured with.
-    #[allow(dead_code)]
+    /// The camera's characteristics, kept for the capability check on reconfiguration.
     characteristics: Metadata,
+    /// The platform's thermal service, when this device has one.
+    thermal: Option<ThermalMonitor>,
+    /// The thermal status the encoder's bitrate currently reflects.
+    thermal_status: ThermalStatus,
 }
 
 impl Pipeline {
@@ -527,20 +674,36 @@ impl Pipeline {
             on_error: Some(on_error),
         });
         let mut device = manager.open(&camera_id, &mut callbacks)?;
+        let stream = Stream::start(&mut device, cfg)?;
 
-        // The encoder first: the session needs the surface its codec was configured with, and
-        // starting the codec before the camera writes into it is what keeps the first frames
-        // from arriving at a codec that is not running yet.
-        let mut encoder = media::Encoder::create(
-            cfg.codec,
-            cfg.width,
-            cfg.height,
-            cfg.fps,
-            cfg.bitrate_kbps,
-        )?;
-        encoder.start()?;
+        // The thermal service is API 30 and may be absent; without it the encoder simply never
+        // throttles, which is the behaviour of every device that predates the service.
+        let thermal = match ThermalMonitor::start() {
+            Some(monitor) => {
+                debug!(status = monitor.status().name(), "thermal monitoring is available");
+                Some(monitor)
+            }
+            None => {
+                debug!(
+                    "no thermal service on this device; the encoder bitrate will not follow heat"
+                );
+                None
+            }
+        };
 
-        let session = session::Session::start(&mut device, encoder.input_surface(), cfg.fps)?;
+        let mut pipeline = Self {
+            stream: Some(stream),
+            cfg: cfg.clone(),
+            device,
+            callbacks,
+            manager,
+            characteristics,
+            thermal,
+            thermal_status: ThermalStatus::Nominal,
+        };
+        // A device that is already hot starts stepped down rather than waiting for the first
+        // two-second poll to notice.
+        pipeline.poll_thermal();
 
         info!(
             camera = %camera_id,
@@ -551,14 +714,126 @@ impl Pipeline {
             "android capture pipeline running"
         );
 
-        Ok(Self {
+        Ok(pipeline)
+    }
+
+    /// Rebuilds the running stream for `switch_camera`, restoring it if the new parameters fail.
+    ///
+    /// The camera carries one session at a time, so the running stream goes before the new one
+    /// is built. A rebuild that cannot come back up — neither with the new parameters nor with
+    /// the previous ones — leaves [`Pipeline::stream`] empty and the capture thread ends, so the
+    /// source reports that capture stopped instead of pretending to stream.
+    fn rebuild(&mut self, cfg: &CaptureConfig) -> Result<(), CaptureError> {
+        // Check the request against what the camera announced before touching the stream: a
+        // geometry it never published cannot start a session, and refusing it here keeps the
+        // running stream exactly as the server believes it is.
+        let matrix = CapabilityMatrix::read(&self.characteristics);
+        matrix.check(cfg.width, cfg.height, cfg.fps)?;
+
+        let previous = self.cfg.clone();
+        self.stream = None;
+        match Stream::start(&mut self.device, cfg) {
+            Ok(stream) => {
+                self.stream = Some(stream);
+                self.cfg = cfg.clone();
+                self.apply_thermal_bitrate();
+                info!(
+                    width = cfg.width,
+                    height = cfg.height,
+                    fps = cfg.fps,
+                    codec = ?cfg.codec,
+                    bitrate_kbps = cfg.bitrate_kbps,
+                    "android capture reconfigured"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                warn!(%error, "the requested Android capture parameters failed; restoring the previous stream");
+                match Stream::start(&mut self.device, &previous) {
+                    Ok(stream) => {
+                        self.stream = Some(stream);
+                        self.apply_thermal_bitrate();
+                    }
+                    Err(restore) => {
+                        error!(%restore, "the previous Android capture parameters no longer work either");
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Captures one still and delivers the JPEG through `cb`.
+    fn take_photo(&mut self, cb: JpegCallback, user: *mut c_void) -> Result<(), CaptureError> {
+        let Some(stream) = self.stream.as_mut() else {
+            return Err(CaptureError::Os(
+                "the Android capture stream is down".to_owned(),
+            ));
+        };
+        let Stream {
             session,
-            encoder,
-            device,
-            callbacks,
-            manager,
-            characteristics,
-        })
+            still: reader,
+            ..
+        } = stream;
+        let Some(reader) = reader.as_mut() else {
+            return Err(CaptureError::UnsupportedParameters);
+        };
+
+        // Anything the camera wrote for an earlier photo but nobody collected is dropped first,
+        // so the JPEG handed to the callback below is the one this call asked for.
+        reader.drain();
+        session.capture_still()?;
+        let jpeg = reader.take_jpeg(STILL_TIMEOUT)?;
+        // SAFETY: `user` is the `CallbackState` box `source.rs` keeps alive for as long as this
+        // backend, and the callback copies the bytes before returning.
+        unsafe { cb(user, jpeg.as_ptr(), jpeg.len()) };
+        debug!(bytes = jpeg.len(), "still delivered");
+        Ok(())
+    }
+
+    /// Reads the platform's thermal status and steps the encoder's bitrate when it moves.
+    fn poll_thermal(&mut self) {
+        let status = match self.thermal.as_ref() {
+            Some(monitor) => monitor.status(),
+            None => return,
+        };
+        if status == self.thermal_status {
+            return;
+        }
+        info!(
+            from = self.thermal_status.name(),
+            to = status.name(),
+            "the device's thermal status changed"
+        );
+        self.thermal_status = status;
+        self.apply_thermal_bitrate();
+    }
+
+    /// Sets the running encoder's bitrate to the configured rate scaled by the thermal status.
+    ///
+    /// This is the whole thermal policy the protocol leaves a device: `resolution` and `fps`
+    /// may not change without an operator `switch_camera`, so heat is paid for in bitrate alone,
+    /// and the rate returns to the configured one as soon as the device cools.
+    fn apply_thermal_bitrate(&mut self) {
+        let percent = self.thermal_status.bitrate_percent();
+        let status = self.thermal_status;
+        let Some(stream) = self.stream.as_mut() else {
+            return;
+        };
+        let target = self.cfg.bitrate_kbps.saturating_mul(percent) / 100;
+        match stream.encoder.set_bitrate(target) {
+            Ok(()) => info!(
+                bitrate_kbps = target,
+                percent,
+                status = status.name(),
+                "encoder bitrate set for the thermal status"
+            ),
+            Err(error) => warn!(
+                %error,
+                status = status.name(),
+                "the encoder refused the thermal bitrate change"
+            ),
+        }
     }
 }
 
