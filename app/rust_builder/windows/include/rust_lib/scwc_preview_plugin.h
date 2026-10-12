@@ -1,0 +1,32 @@
+// The camera preview as a Flutter texture, painted from frames the capture path published.
+//
+// The interface talks to `scwc_preview` — `start` registers the texture and answers its id, `stop`
+// unregisters it, `size` answers the shape of the frame it paints — and the plugin tells the engine
+// when a newer frame is waiting.
+//
+// The plugin registrant the Flutter tooling generates calls `ScwcPreviewPluginRegisterWithRegistrar`
+// at startup.
+
+#ifndef FLUTTER_PLUGIN_RUST_LIB_SCWC_PREVIEW_PLUGIN_H_
+#define FLUTTER_PLUGIN_RUST_LIB_SCWC_PREVIEW_PLUGIN_H_
+
+#include <flutter_plugin_registrar.h>
+
+#ifdef FLUTTER_PLUGIN_IMPL
+#define FLUTTER_PLUGIN_EXPORT __declspec(dllexport)
+#else
+#define FLUTTER_PLUGIN_EXPORT __declspec(dllimport)
+#endif
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+FLUTTER_PLUGIN_EXPORT void ScwcPreviewPluginRegisterWithRegistrar(
+    FlutterDesktopPluginRegistrarRef registrar);
+
+#if defined(__cplusplus)
+}  // extern "C"
+#endif
+
+#endif  // FLUTTER_PLUGIN_RUST_LIB_SCWC_PREVIEW_PLUGIN_H_
