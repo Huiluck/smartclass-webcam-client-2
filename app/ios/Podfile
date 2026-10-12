@@ -1,5 +1,5 @@
 # Uncomment this line to define a global platform for your project
-# platform :ios, '13.0'
+platform :ios, '15.0'
 
 # CocoaPods analytics sends network stats synchronously affecting flutter build latency.
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
@@ -39,5 +39,20 @@ end
 post_install do |installer|
   installer.pods_project.targets.each do |target|
     flutter_additional_ios_build_settings(target)
+  end
+  # The rust_lib static library uses the VideoToolbox encoder on iOS, but
+  # nothing else links the framework, so the Runner link fails with undefined
+  # _kVTCompressionPropertyKey_* symbols.
+  installer.aggregate_targets.each do |aggregate|
+    aggregate.user_project.targets.each do |target|
+      next unless target.name == 'Runner'
+      target.build_configurations.each do |config|
+        ldflags = config.build_settings['OTHER_LDFLAGS'] || ['$(inherited)']
+        ldflags = [ldflags] if ldflags.is_a?(String)
+        ldflags << '-framework' << 'VideoToolbox' unless ldflags.include?('VideoToolbox')
+        config.build_settings['OTHER_LDFLAGS'] = ldflags
+      end
+    end
+    aggregate.user_project.save
   end
 end
