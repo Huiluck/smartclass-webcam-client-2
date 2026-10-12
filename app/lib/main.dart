@@ -54,6 +54,46 @@ class LogEntry {
   final String message;
 }
 
+/// One capture-parameter set: what the pickers stage and what the agent runs.
+///
+/// The bitrate is optional because the protocol has no field for it: an empty field means "let
+/// the client derive one", which the core does from the other three values.
+class CaptureParams {
+  const CaptureParams({
+    required this.resolution,
+    required this.fps,
+    required this.codec,
+    required this.bitrateKbps,
+  });
+
+  /// Protocol resolution, for example `1920x1080`.
+  final String resolution;
+
+  /// Frame rate in frames per second.
+  final int fps;
+
+  /// `h264` or `h265`.
+  final String codec;
+
+  /// Encoder bitrate in kilobits per second; null means the client derives one.
+  final int? bitrateKbps;
+
+  @override
+  bool operator ==(Object other) =>
+      other is CaptureParams &&
+      other.resolution == resolution &&
+      other.fps == fps &&
+      other.codec == codec &&
+      other.bitrateKbps == bitrateKbps;
+
+  @override
+  int get hashCode => Object.hash(resolution, fps, codec, bitrateKbps);
+
+  @override
+  String toString() =>
+      '$resolution @ ${fps}fps $codec ${bitrateKbps ?? 'auto'}kbps';
+}
+
 /// Resolutions of [camera], largest first, as announced by the platform.
 List<String> _resolutionsOf(CameraInfoDto camera) => [
   for (final preset in camera.presets) preset.$1,
@@ -68,17 +108,72 @@ List<int> _frameRatesOf(CameraInfoDto camera, String? resolution) {
   return const [];
 }
 
+/// The two sides of a `WIDTHxHEIGHT` resolution, or null when it cannot be read.
+(int, int)? _parseResolution(String? resolution) {
+  final parts = resolution?.split('x');
+  if (parts == null || parts.length != 2) return null;
+  final width = int.tryParse(parts[0]);
+  final height = int.tryParse(parts[1]);
+  if (width == null || height == null) return null;
+  return (width, height);
+}
+
+/// How much a resolution's aspect ratio is preferred: 4:3 first, then 16:9, then anything else.
+///
+/// The ratio is read with the longer side first, so the portrait preset of a 16:9 sensor still
+/// counts as 16:9.
+int _aspectRank(int width, int height) {
+  const tolerance = 0.01;
+  final ratio = width >= height ? width / height : height / width;
+  if ((ratio - 4 / 3).abs() <= tolerance) return 0;
+  if ((ratio - 16 / 9).abs() <= tolerance) return 1;
+  return 2;
+}
+
+/// The preset a camera starts on: [1] the best-ranked aspect ratio, then its largest resolution,
+/// as `(resolution, frame rate)`. The frame rate is the highest that resolution announces, and
+/// the result is null when the camera announces nothing usable.
+(String, int)? _defaultPreset(CameraInfoDto camera) {
+  (String, int)? best;
+  var bestRank = 0;
+  var bestPixels = 0;
+
+  for (final preset in camera.presets) {
+    final (resolution, rates) = preset;
+    final size = _parseResolution(resolution);
+    if (size == null || rates.isEmpty) continue;
+
+    final (width, height) = size;
+    final rank = _aspectRank(width, height);
+    final pixels = width * height;
+    // Rank first, then the largest resolution within the class. Presets arrive largest first, but
+    // that is the platform's own order, not something to rely on.
+    final better =
+        best == null || rank < bestRank || (rank == bestRank && pixels > bestPixels);
+    if (!better) continue;
+
+    best = (resolution, rates.reduce((a, b) => a > b ? a : b));
+    bestRank = rank;
+    bestPixels = pixels;
+  }
+
+  return best;
+}
+
 /// Everything the single page shows: connection fields, camera selection, agent status, event log.
 class AgentState extends ChangeNotifier {
   static const List<String> codecs = ['h264', 'h265'];
-  static const int defaultBitrateKbps = 30000;
+
+  /// Bits per pixel the encoders are budgeted, mirrored from the core
+  /// (`crates/core/src/media.rs`): 3840x2160 at 60 fps lands at about 53 Mbps for H.264 and
+  /// 30 Mbps for every other codec.
+  static const double _h264BitsPerPixel = 0.107;
+  static const double _hevcBitsPerPixel = 0.060;
+
   static const int _maxLogEntries = 100;
 
-  static const String _kServer = 'server';
-  static const String _kDeviceId = 'device_id';
-  static const String _kToken = 'token';
   static const String _kCodec = 'codec';
-  static const String _kBitrate = 'bitrate_kbps';
+  static const String _kBitrate = 'bitrate';
   static const String _kCameraId = 'camera_id';
   static const String _kResolution = 'resolution';
   static const String _kFps = 'fps';
@@ -86,9 +181,7 @@ class AgentState extends ChangeNotifier {
   final TextEditingController serverController = TextEditingController();
   final TextEditingController deviceIdController = TextEditingController();
   final TextEditingController tokenController = TextEditingController();
-  final TextEditingController bitrateController = TextEditingController(
-    text: '$defaultBitrateKbps',
-  );
+  final TextEditingController bitrateController = TextEditingController();
 
   final List<LogEntry> _log = [];
 
@@ -104,6 +197,14 @@ class AgentState extends ChangeNotifier {
   bool _busy = false;
   bool _disposed = false;
   bool _restoring = false;
+
+  /// The parameters the running agent uses, as the core last reported them; null while no agent
+  /// runs. The core has the last word — a switch from an earlier run, or one the server issued,
+  /// wins over what the pickers ask for.
+  CaptureParams? _liveParams;
+
+  /// The camera the running agent captures from.
+  String? _liveCameraId;
 
   SharedPreferences? _prefs;
   StreamSubscription<AgentEvent>? _events;
@@ -122,13 +223,16 @@ class AgentState extends ChangeNotifier {
     }
   }
 
-  /// Restores persisted settings, subscribes to the agent's events and lists the cameras.
+  /// Restores the persisted selection, loads the stored server identity, subscribes to the
+  /// agent's events, lists the cameras, and connects on its own when the identity is there.
   Future<void> load() async {
     _prefs = await SharedPreferences.getInstance();
     _restore();
+    final hasServerConfig = _restoreServerConfig();
     _notify();
     _events = agentEvents().listen(_onEvent, onError: _onStreamError);
     refreshCameras();
+    await _autoStart(hasServerConfig);
   }
 
   @override
@@ -157,10 +261,67 @@ class AgentState extends ChangeNotifier {
 
   String get codec => _codec;
 
-  /// Parsed bitrate, null while the field is not a positive number.
+  /// Parsed bitrate, null while the field is empty (the client derives one) or not a number.
   int? get bitrate {
     final value = int.tryParse(bitrateController.text.trim());
     return value != null && value > 0 ? value : null;
+  }
+
+  /// True while the field holds something that is not a positive number.
+  ///
+  /// An empty field is not an error: it asks the client to derive the bitrate from the codec, the
+  /// resolution and the frame rate.
+  bool get bitrateInvalid =>
+      bitrateController.text.trim().isNotEmpty && bitrate == null;
+
+  /// The capture parameters the pickers stage; null until a resolution and frame rate are picked.
+  CaptureParams? get stagedParams {
+    final resolution = _resolution;
+    final fps = _fps;
+    if (resolution == null || fps == null) return null;
+    return CaptureParams(
+      resolution: resolution,
+      fps: fps,
+      codec: _codec,
+      bitrateKbps: bitrate,
+    );
+  }
+
+  /// The parameters the running agent uses, if any.
+  CaptureParams? get liveParams => _liveParams;
+
+  /// True while the staged selection differs from what the running agent uses.
+  bool get stagedDiffers {
+    final staged = stagedParams;
+    if (staged == null) return false;
+    final camera = _camera?.id;
+    return staged != _liveParams || (camera != null && camera != _liveCameraId);
+  }
+
+  /// True when [apply] has something to send.
+  bool get canApply => _running && !_busy && !bitrateInvalid && stagedDiffers;
+
+  /// The bitrate the client derives for the staged selection, or null while there is nothing to
+  /// derive it from.
+  ///
+  /// Mirrors the core's formula (`crates/core/src/media.rs`): `width * height * fps` pixels per
+  /// second at a codec-specific budget of bits per pixel, rounded up.
+  int? get computedBitrateKbps {
+    final size = _parseResolution(_resolution);
+    final fps = _fps;
+    if (size == null || fps == null) return null;
+
+    final bitsPerPixel = _codec == 'h264'
+        ? _h264BitsPerPixel
+        : _hevcBitsPerPixel;
+    final kbps = (size.$1 * size.$2 * fps * bitsPerPixel / 1000).ceil();
+    return kbps < 1 ? 1 : kbps;
+  }
+
+  /// What the bitrate field shows while it is empty.
+  String get bitrateHint {
+    final kbps = computedBitrateKbps;
+    return kbps == null ? 'auto' : 'auto: $kbps';
   }
 
   /// Resolutions offered by [camera].
@@ -173,7 +334,7 @@ class AgentState extends ChangeNotifier {
 
   bool get running => _running;
 
-  /// True while [start] or [stop] is in flight.
+  /// True while [_connect], [stop] or [apply] is in flight.
   bool get busy => _busy;
 
   /// Newest first, at most [_maxLogEntries] lines.
@@ -195,6 +356,9 @@ class AgentState extends ChangeNotifier {
     AgentEvent_RecordingStopped() => 'Online, stream stopped',
     AgentEvent_Reconnecting(:final attempt) =>
       'Reconnecting (attempt $attempt)',
+    AgentEvent_Warn(:final message) => 'Warning: $message',
+    AgentEvent_ParametersApplied() => 'Online, parameters applied',
+    AgentEvent_Notice() => 'Online',
     AgentEvent_Error(:final message) => 'Error: $message',
     AgentEvent_Stats() => 'Idle',
   };
@@ -203,7 +367,24 @@ class AgentState extends ChangeNotifier {
       ? 'No stats yet'
       : 'Sent $_sentFrames frames, dropped ${_droppedFrames ?? BigInt.zero}';
 
-  bool get canStart =>
+  /// The applied parameters, and the staged ones while they still differ, for the status card.
+  String? get appliedText {
+    final live = _liveParams;
+    if (live == null) return null;
+
+    final staged = stagedParams;
+    if (canApply && staged != null) {
+      return 'Capture: $live  |  apply: $staged';
+    }
+    return 'Capture: $live';
+  }
+
+  /// True when [_connect] has everything it needs: an identity, a camera and a full selection.
+  ///
+  /// Not a user action of its own — there is no start control: the two ways in are the launch,
+  /// when a stored identity exists, and [saveAndReconnect], which the operator uses for a
+  /// first-time or changed configuration.
+  bool get _canConnect =>
       !_busy &&
       !_running &&
       serverController.text.trim().isNotEmpty &&
@@ -212,7 +393,7 @@ class AgentState extends ChangeNotifier {
       _camera != null &&
       _resolution != null &&
       _fps != null &&
-      bitrate != null;
+      !bitrateInvalid;
 
   /// Lists cameras and re-applies the persisted selection.
   void refreshCameras() {
@@ -279,17 +460,23 @@ class AgentState extends ChangeNotifier {
     _notify();
   }
 
-  /// Starts the agent with the current settings.
-  Future<void> start() async {
+  /// Starts the agent with the staged selection.
+  ///
+  /// Internal on purpose, and reached two ways only: [load] connects the launch when a stored
+  /// identity exists, and [saveAndReconnect] connects after the operator configured the client.
+  /// A request that cannot be honoured is reported rather than silently ignored, because both
+  /// callers looked like they asked for a connection.
+  Future<void> _connect() async {
+    final staged = stagedParams;
     final camera = _camera;
-    final size = _parseResolution(_resolution);
-    final fps = _fps;
-    final bitrateKbps = bitrate;
-    if (!canStart ||
-        camera == null ||
-        size == null ||
-        fps == null ||
-        bitrateKbps == null) {
+    final size = _parseResolution(staged?.resolution);
+    if (!_canConnect || staged == null || camera == null || size == null) {
+      _addLog(
+        _busy
+            ? 'not connecting now: another agent operation is in flight'
+            : 'nothing to connect with yet: pick a camera and its resolution',
+      );
+      _notify();
       return;
     }
 
@@ -304,18 +491,19 @@ class AgentState extends ChangeNotifier {
           cameraId: camera.id,
           width: size.$1,
           height: size.$2,
-          fps: fps,
-          codec: _codec,
-          bitrateKbps: bitrateKbps,
+          fps: staged.fps,
+          codec: staged.codec,
+          bitrateKbps: staged.bitrateKbps,
         ),
       );
       _running = true;
-      _addLog(
-        'Agent started: ${camera.name} $_resolution @ ${fps}fps '
-        '$_codec ${bitrateKbps}kbps',
-      );
+      // Optimistic until the core reports the set it actually applied: a switch remembered from
+      // an earlier run takes precedence over the announced defaults.
+      _liveParams = staged;
+      _liveCameraId = camera.id;
+      _addLog('agent started: ${camera.name} $staged');
     } catch (error) {
-      _addLog('Start failed: $error');
+      _addLog('start failed: $error');
     } finally {
       _busy = false;
       _notify();
@@ -323,19 +511,93 @@ class AgentState extends ChangeNotifier {
   }
 
   /// Asks the agent to wind down.
+  ///
+  /// The agent cancels everything it is doing, including the retries that would otherwise bring it
+  /// back.
   Future<void> stop() async {
     _busy = true;
     _notify();
     try {
       await stopAgent();
       _running = false;
-      _addLog('Agent stopped');
+      _liveParams = null;
+      _liveCameraId = null;
+      _addLog('agent stopped');
     } catch (error) {
-      _addLog('Stop failed: $error');
+      _addLog('stop failed: $error');
     } finally {
       _busy = false;
       _notify();
     }
+  }
+
+  /// Sends the staged selection to the running agent.
+  ///
+  /// Resolution, frame rate, codec and bitrate travel the same path a server-issued
+  /// `switch_camera` takes: applied at once while no stream is live, and once the live one ends
+  /// otherwise, so a recording keeps the parameters it started with. A camera change cannot travel
+  /// that path — the agent holds one open device — so it restarts the agent with the staged set.
+  Future<void> apply() async {
+    final staged = stagedParams;
+    if (!canApply || staged == null) return;
+
+    if (_camera != null && _camera!.id != _liveCameraId) {
+      await _restart();
+      return;
+    }
+
+    _busy = true;
+    _notify();
+    try {
+      applyCaptureParams(
+        resolution: staged.resolution,
+        fps: staged.fps,
+        codec: staged.codec,
+        bitrateKbps: staged.bitrateKbps,
+      );
+      _addLog('apply requested: $staged');
+    } catch (error) {
+      _addLog('apply failed: $error');
+    } finally {
+      _busy = false;
+      _notify();
+    }
+  }
+
+  /// Restarts the agent so it captures from the staged camera with the staged parameters.
+  Future<void> _restart() async {
+    _addLog('camera changed; restarting the agent');
+    await stop();
+    await _connect();
+  }
+
+  /// Stores the server identity and connects with it.
+  ///
+  /// The one way the client is configured: the identity is always written to
+  /// `<config dir>/sc-webcam/server.json`, and then used — starting the agent when none runs, and
+  /// asking the running one to register again at its first opportunity otherwise. The core
+  /// decides when that is: right away while no stream is live, and once the live one ends
+  /// otherwise, so a recording is never cut short by the change.
+  Future<void> saveAndReconnect() async {
+    try {
+      saveServerConfig(
+        server: serverController.text.trim(),
+        deviceId: deviceIdController.text.trim(),
+        token: tokenController.text.trim(),
+      );
+      _addLog(
+        _running
+            ? 'server configuration saved; the agent reconnects when it can'
+            : 'server configuration saved; connecting',
+      );
+    } catch (error) {
+      // Storing the identity must not keep the client from connecting: the operator asked for a
+      // connection, and the log says what became of the file.
+      _addLog('could not store the server configuration: $error');
+    }
+    _notify();
+
+    if (!_running) await _connect();
   }
 
   void _onEvent(AgentEvent event) {
@@ -363,6 +625,29 @@ class AgentState extends ChangeNotifier {
         _running = true;
         _status = event;
         _addLog('reconnecting (attempt $attempt)');
+      case AgentEvent_ParametersApplied(
+        :final resolution,
+        :final fps,
+        :final codec,
+        :final bitrateKbps,
+      ):
+        // The core has the last word on what the camera runs, so the staged selection is measured
+        // against this rather than against what it was asked for.
+        _liveParams = CaptureParams(
+          resolution: resolution,
+          fps: fps,
+          codec: codec,
+          bitrateKbps: bitrateKbps,
+        );
+        _addLog('parameters applied: $_liveParams');
+      case AgentEvent_Notice(:final message):
+        // A request the core had to postpone, a switch or a reconnect that waits for a stream. It
+        // says nothing about the run itself, so the status stays where it was.
+        _addLog(message);
+      case AgentEvent_Warn(:final message):
+        // A warning says nothing about the run itself, so it only lands in the log; the status
+        // stays with whichever event described the agent's state.
+        _addLog('warning: $message');
       case AgentEvent_Error(:final message):
         _running = false;
         _status = event;
@@ -376,8 +661,10 @@ class AgentState extends ChangeNotifier {
     _notify();
   }
 
-  /// Picks the camera plus a resolution/frame rate pair that exists on it, preferring the
-  /// persisted (or previously chosen) values when the camera still offers them.
+  /// Picks the camera plus a resolution/frame rate pair, preferring the persisted (or previously
+  /// chosen) values when the camera still offers them and the spec's default otherwise: the
+  /// preferred aspect ratio, its largest resolution, and the highest rate that resolution
+  /// announces.
   void _applySelection(
     CameraInfoDto? camera, {
     String? preferResolution,
@@ -389,14 +676,18 @@ class AgentState extends ChangeNotifier {
       _fps = null;
       return;
     }
+
+    final preferred = _defaultPreset(camera);
     final resolutions = _resolutionsOf(camera);
     _resolution = resolutions.contains(preferResolution)
         ? preferResolution
-        : (resolutions.isEmpty ? null : resolutions.first);
+        : (preferred?.$1 ?? (resolutions.isEmpty ? null : resolutions.first));
+
     final rates = _frameRatesOf(camera, _resolution);
+    final preferredFps = _resolution == preferred?.$1 ? preferred?.$2 : null;
     _fps = rates.contains(preferFps)
         ? preferFps
-        : (rates.isEmpty ? null : rates.first);
+        : (preferredFps ?? (rates.isEmpty ? null : rates.reduce((a, b) => a > b ? a : b)));
   }
 
   void _onFieldChanged() {
@@ -410,15 +701,13 @@ class AgentState extends ChangeNotifier {
     final prefs = _prefs!;
     _restoring = true;
     try {
-      serverController.text = prefs.getString(_kServer) ?? '';
-      deviceIdController.text = prefs.getString(_kDeviceId) ?? '';
-      tokenController.text = prefs.getString(_kToken) ?? '';
-      bitrateController.text =
-          '${prefs.getInt(_kBitrate) ?? defaultBitrateKbps}';
+      // The server identity is not restored from here: the client stores it itself, which is what
+      // lets a launch connect before the operator touches anything (see loadServerConfig).
       final codec = prefs.getString(_kCodec);
       if (codec != null && codecs.contains(codec)) {
         _codec = codec;
       }
+      bitrateController.text = prefs.getString(_kBitrate) ?? '';
       _savedCameraId = prefs.getString(_kCameraId);
       _savedResolution = prefs.getString(_kResolution);
       _savedFps = prefs.getInt(_kFps);
@@ -427,20 +716,47 @@ class AgentState extends ChangeNotifier {
     }
   }
 
+  /// Fills the server fields from the identity the client has stored; `false` when there is none.
+  bool _restoreServerConfig() {
+    final config = _storedServerConfig();
+    if (config == null) return false;
+
+    _restoring = true;
+    try {
+      serverController.text = config.server;
+      deviceIdController.text = config.deviceId;
+      tokenController.text = config.token;
+    } finally {
+      _restoring = false;
+    }
+    return true;
+  }
+
+  /// The identity the client stored, or null when it stored none yet or it cannot be read.
+  ServerConfig? _storedServerConfig() {
+    try {
+      return loadServerConfig();
+    } catch (error) {
+      _addLog('loadServerConfig failed: $error');
+      return null;
+    }
+  }
+
+  /// Connects without a click when a stored server identity and a camera are both there.
+  Future<void> _autoStart(bool hasServerConfig) async {
+    if (!hasServerConfig || _camera == null) return;
+
+    _addLog('saved server configuration found; connecting');
+    await _connect();
+  }
+
   void _persist() {
     final prefs = _prefs;
     if (prefs == null) return;
-    unawaited(prefs.setString(_kServer, serverController.text.trim()));
-    unawaited(prefs.setString(_kDeviceId, deviceIdController.text.trim()));
-    // Stored so a restart is painless; never written to the log.
-    unawaited(prefs.setString(_kToken, tokenController.text));
     unawaited(prefs.setString(_kCodec, _codec));
-    unawaited(
-      prefs.setInt(
-        _kBitrate,
-        int.tryParse(bitrateController.text.trim()) ?? defaultBitrateKbps,
-      ),
-    );
+    // Stored as it stands, so an empty field — the client derives the bitrate — survives a
+    // restart as an empty field.
+    unawaited(prefs.setString(_kBitrate, bitrateController.text.trim()));
     _persistSelection();
   }
 
@@ -473,15 +789,6 @@ class AgentState extends ChangeNotifier {
 
   void _notify() {
     if (!_disposed) notifyListeners();
-  }
-
-  static (int, int)? _parseResolution(String? resolution) {
-    final parts = resolution?.split('x');
-    if (parts == null || parts.length != 2) return null;
-    final width = int.tryParse(parts[0]);
-    final height = int.tryParse(parts[1]);
-    if (width == null || height == null) return null;
-    return (width, height);
   }
 }
 
@@ -531,7 +838,10 @@ class HomePage extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Text('Connection', style: Theme.of(context).textTheme.titleMedium),
+            Text(
+              'Connection',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
             const SizedBox(height: 8),
             TextField(
               controller: state.serverController,
@@ -574,13 +884,22 @@ class HomePage extends StatelessWidget {
                     keyboardType: TextInputType.number,
                     decoration: InputDecoration(
                       labelText: 'Bitrate (kbps)',
-                      errorText: state.bitrate == null
-                          ? 'Enter a number'
-                          : null,
+                      // Empty means the client derives one; the hint says which.
+                      hintText: state.bitrateHint,
+                      errorText: state.bitrateInvalid ? 'Enter a number' : null,
                     ),
                   ),
                 ),
               ],
+            ),
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerRight,
+              child: FilledButton.tonalIcon(
+                onPressed: state.saveAndReconnect,
+                icon: const Icon(Icons.save, size: 18),
+                label: const Text('保存并重连'),
+              ),
             ),
           ],
         ),
@@ -673,12 +992,18 @@ class HomePage extends StatelessWidget {
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Row(
         children: [
+          // The only control over a live connection: there is no start button, a launch with a
+          // stored identity connects by itself and 保存并重连 connects after a configuration.
           FilledButton.icon(
-            onPressed: state.busy
-                ? null
-                : (state.running ? state.stop : state.start),
-            icon: Icon(state.running ? Icons.stop : Icons.play_arrow),
-            label: Text(state.running ? 'Stop' : 'Start'),
+            onPressed: state.running && !state.busy ? state.stop : null,
+            icon: const Icon(Icons.stop),
+            label: const Text('Stop'),
+          ),
+          const SizedBox(width: 12),
+          FilledButton.tonalIcon(
+            onPressed: state.canApply ? state.apply : null,
+            icon: const Icon(Icons.check, size: 18),
+            label: const Text('Apply'),
           ),
           const SizedBox(width: 12),
           if (state.busy)
@@ -686,13 +1011,6 @@ class HomePage extends StatelessWidget {
               width: 16,
               height: 16,
               child: CircularProgressIndicator(strokeWidth: 2),
-            ),
-          if (!state.running && !state.busy && !state.canStart)
-            const Expanded(
-              child: Text(
-                'Fill in the connection and pick a camera to start',
-                style: TextStyle(fontSize: 12),
-              ),
             ),
         ],
       ),
@@ -728,6 +1046,10 @@ class HomePage extends StatelessWidget {
             ),
             const SizedBox(height: 4),
             Text(state.statsText),
+            if (state.appliedText != null) ...[
+              const SizedBox(height: 4),
+              Text(state.appliedText!),
+            ],
           ],
         ),
       ),

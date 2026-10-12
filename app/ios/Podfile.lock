@@ -1,0 +1,22 @@
+PODS:
+  - Flutter (1.0.0)
+  - rust_lib (0.0.1):
+    - Flutter
+
+DEPENDENCIES:
+  - Flutter (from `Flutter`)
+  - rust_lib (from `.symlinks/plugins/rust_lib/ios`)
+
+EXTERNAL SOURCES:
+  Flutter:
+    :path: Flutter
+  rust_lib:
+    :path: ".symlinks/plugins/rust_lib/ios"
+
+SPEC CHECKSUMS:
+  Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
+  rust_lib: 917769363b7be5699e29c3bcb57ad6e870e598a9
+
+PODFILE CHECKSUM: 53a6aebc29ccee84c41f92f409fc20cd4ca011f1
+
+COCOAPODS: 1.17.0

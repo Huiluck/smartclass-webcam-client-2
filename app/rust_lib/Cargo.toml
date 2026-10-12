@@ -15,6 +15,17 @@ scwc-capture = { path = "../../crates/capture" }
 scwc-protocol = { path = "../../crates/protocol" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 
+# The crates log through tracing, which does nothing without a subscriber; the app installs one.
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# The server identity the UI stores lives in a JSON file next to the core's capture state.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Platform configuration directory for the capture-parameter state the core persists.
+dirs = "6"
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
 

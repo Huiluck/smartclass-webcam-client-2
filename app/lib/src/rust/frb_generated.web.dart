@@ -40,6 +40,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   AgentConfig dco_decode_box_autoadd_agent_config(dynamic raw);
 
   @protected
+  ServerConfig dco_decode_box_autoadd_server_config(dynamic raw);
+
+  @protected
+  int dco_decode_box_autoadd_u_32(dynamic raw);
+
+  @protected
   CameraInfoDto dco_decode_camera_info_dto(dynamic raw);
 
   @protected
@@ -56,9 +62,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   dco_decode_list_record_string_list_prim_u_32_strict(dynamic raw);
 
   @protected
+  ServerConfig? dco_decode_opt_box_autoadd_server_config(dynamic raw);
+
+  @protected
+  int? dco_decode_opt_box_autoadd_u_32(dynamic raw);
+
+  @protected
   (String, Uint32List) dco_decode_record_string_list_prim_u_32_strict(
     dynamic raw,
   );
+
+  @protected
+  ServerConfig dco_decode_server_config(dynamic raw);
 
   @protected
   int dco_decode_u_32(dynamic raw);
@@ -93,6 +108,14 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   AgentConfig sse_decode_box_autoadd_agent_config(SseDeserializer deserializer);
 
   @protected
+  ServerConfig sse_decode_box_autoadd_server_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  int sse_decode_box_autoadd_u_32(SseDeserializer deserializer);
+
+  @protected
   CameraInfoDto sse_decode_camera_info_dto(SseDeserializer deserializer);
 
   @protected
@@ -113,9 +136,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  ServerConfig? sse_decode_opt_box_autoadd_server_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  int? sse_decode_opt_box_autoadd_u_32(SseDeserializer deserializer);
+
+  @protected
   (String, Uint32List) sse_decode_record_string_list_prim_u_32_strict(
     SseDeserializer deserializer,
   );
+
+  @protected
+  ServerConfig sse_decode_server_config(SseDeserializer deserializer);
 
   @protected
   int sse_decode_u_32(SseDeserializer deserializer);
@@ -163,6 +197,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_server_config(
+    ServerConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_u_32(int self, SseSerializer serializer);
+
+  @protected
   void sse_encode_camera_info_dto(CameraInfoDto self, SseSerializer serializer);
 
   @protected
@@ -190,10 +233,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_server_config(
+    ServerConfig? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_u_32(int? self, SseSerializer serializer);
+
+  @protected
   void sse_encode_record_string_list_prim_u_32_strict(
     (String, Uint32List) self,
     SseSerializer serializer,
   );
+
+  @protected
+  void sse_encode_server_config(ServerConfig self, SseSerializer serializer);
 
   @protected
   void sse_encode_u_32(int self, SseSerializer serializer);
