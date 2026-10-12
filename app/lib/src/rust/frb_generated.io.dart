@@ -26,6 +26,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   RustStreamSink<AgentEvent> dco_decode_StreamSink_agent_event_Sse(dynamic raw);
 
   @protected
+  RustStreamSink<PreviewFrame> dco_decode_StreamSink_preview_frame_Sse(
+    dynamic raw,
+  );
+
+  @protected
   String dco_decode_String(dynamic raw);
 
   @protected
@@ -66,6 +71,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   int? dco_decode_opt_box_autoadd_u_32(dynamic raw);
 
   @protected
+  PreviewFrame dco_decode_preview_frame(dynamic raw);
+
+  @protected
   (String, Uint32List) dco_decode_record_string_list_prim_u_32_strict(
     dynamic raw,
   );
@@ -90,6 +98,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   RustStreamSink<AgentEvent> sse_decode_StreamSink_agent_event_Sse(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  RustStreamSink<PreviewFrame> sse_decode_StreamSink_preview_frame_Sse(
     SseDeserializer deserializer,
   );
 
@@ -142,6 +155,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   int? sse_decode_opt_box_autoadd_u_32(SseDeserializer deserializer);
 
   @protected
+  PreviewFrame sse_decode_preview_frame(SseDeserializer deserializer);
+
+  @protected
   (String, Uint32List) sse_decode_record_string_list_prim_u_32_strict(
     SseDeserializer deserializer,
   );
@@ -176,6 +192,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_StreamSink_agent_event_Sse(
     RustStreamSink<AgentEvent> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_StreamSink_preview_frame_Sse(
+    RustStreamSink<PreviewFrame> self,
     SseSerializer serializer,
   );
 
@@ -238,6 +260,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_opt_box_autoadd_u_32(int? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_preview_frame(PreviewFrame self, SseSerializer serializer);
 
   @protected
   void sse_encode_record_string_list_prim_u_32_strict(
