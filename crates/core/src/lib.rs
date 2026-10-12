@@ -13,6 +13,8 @@
 //! - `media`: pull frames from the [`FrameSource`], queue them with a drop policy.
 //! - `params`: remember the capture parameters a switch applied, in memory and on disk.
 //! - `command`: the requests an embedding application sends while the client runs.
+//! - `preview`: the live picture an embedding application paints, converted and scaled out of
+//!   the frames the capture layer captures.
 //! - [`run`]: the supervisor that ties all of the above into a reconnect loop.
 //!
 //! # Quick start
@@ -58,6 +60,10 @@
 //!   delta frames are discarded until the next keyframe when the queue overflows.
 //! - Any close re-registers from scratch behind exponential backoff (1s, doubling, capped
 //!   at 30s, reset after a session that stayed up longer than 60s).
+//! - The frame source belongs to [`run`] for as long as it runs, never to a session: a
+//!   session that ends, fails or panics tears itself down and is replaced, while the source —
+//!   and with it the camera — stays open and keeps its parameters. Only the caller dropping
+//!   the source closes the camera.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -70,6 +76,9 @@ mod error;
 mod events;
 mod media;
 mod params;
+
+/// The live camera picture an embedding application paints.
+pub mod preview;
 mod register;
 mod session;
 mod supervisor;

@@ -56,6 +56,19 @@ struct ActiveStream {
     task: JoinHandle<()>,
 }
 
+impl Drop for ActiveStream {
+    /// Aborts the capture task the session was running.
+    ///
+    /// [`ControlState::stop_active`] is how a stream ends normally, and it awaits the task
+    /// before this runs, so the abort here only ever matters when the session itself is gone —
+    /// a panic inside it. Then this is what stops the pipeline from pulling frames into a queue
+    /// nobody reads any more, and what releases the frame source it holds the moment the
+    /// session dies instead of at the next frame.
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// Per-session device state: the announced cameras, the active stream and the outbound
 /// queues, plus the command handling that operates on them.
 pub(crate) struct ControlState<F: FrameSource> {

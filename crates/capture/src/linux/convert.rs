@@ -210,6 +210,38 @@ pub(crate) fn rgb_from_nv12(
     Ok(())
 }
 
+/// Converts a packed NV12 frame into packed BGRA, replacing the contents of `bgra`.
+///
+/// This is the live preview's layout — four bytes per pixel, blue first — which the core scales
+/// and swaps into the RGBA an image widget takes.
+pub(crate) fn bgra_from_nv12(
+    source: &[u8],
+    pitch: usize,
+    width: usize,
+    height: usize,
+    bgra: &mut Vec<u8>,
+) -> Result<(), CaptureError> {
+    let luma_len = width * height;
+    let chroma_base = pitch * height;
+    require_capacity(source, luma_len)?;
+    bgra.clear();
+    bgra.reserve(luma_len * 4);
+
+    for row in 0..height {
+        let luma_row = row_slice(source, row * pitch, width)?;
+        let chroma_row = row_slice(source, chroma_base + (row / 2) * pitch, width)?;
+        for column in 0..width {
+            let (red, green, blue) = rgb_of(
+                luma_row[column],
+                chroma_row[(column / 2) * 2],
+                chroma_row[(column / 2) * 2 + 1],
+            );
+            bgra.extend_from_slice(&[blue, green, red, u8::MAX]);
+        }
+    }
+    Ok(())
+}
+
 /// Converts packed YUYV (4:2:2) into RGB24, replacing the contents of `rgb`.
 pub(crate) fn rgb_from_yuyv(
     source: &[u8],

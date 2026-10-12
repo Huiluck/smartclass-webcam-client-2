@@ -457,6 +457,8 @@ struct Pipeline {
     format: PixelFormat,
     /// Latest camera frame, kept for `take_photo`.
     still: Option<StillFrame>,
+    /// Reused staging for the frames the live preview gets.
+    preview: Vec<u8>,
     /// Shortest spacing between two frames handed to the encoder, in 100 ns units.
     frame_interval: i64,
     /// Timestamp of the last frame handed to the encoder.
@@ -538,6 +540,7 @@ impl Pipeline {
                         stride,
                         format,
                         still: None,
+                        preview: Vec::new(),
                         frame_interval: frame_interval(cfg.fps),
                         last_submitted: None,
                     })
@@ -600,6 +603,9 @@ impl Pipeline {
         user: *mut c_void,
     ) -> Result<(), CaptureError> {
         self.capture_still(sample);
+        // The preview comes from the frame the photo path just kept, which is the one the
+        // encoder is about to be given: what the interface shows is what is being recorded.
+        self.publish_preview();
         if !self.should_submit(sample) {
             return Ok(());
         }
@@ -665,6 +671,24 @@ impl Pipeline {
                 still.format = format;
             }
             Err(failure) => warn!(error = %failure, "cannot keep a still of the current camera frame"),
+        }
+    }
+
+    /// Offers the newest camera frame to the live preview.
+    ///
+    /// Built from the copy the photo path keeps rather than from the reader's own buffer, which
+    /// the source recycles. Nothing is converted while no preview is wanted: the conversion is a
+    /// whole-frame pass.
+    fn publish_preview(&mut self) {
+        if !scwc_core::preview::preview_enabled() {
+            return;
+        }
+        let Some(still) = self.still.as_ref().filter(|still| !still.data.is_empty()) else {
+            return;
+        };
+        match still.to_bgra(&mut self.preview) {
+            Ok(()) => scwc_core::preview::publish_bgra(&self.preview, still.width, still.height),
+            Err(error) => warn!(%error, "could not build the preview frame"),
         }
     }
 
@@ -992,6 +1016,20 @@ impl PixelFormat {
 impl StillFrame {
     /// Converts the frame to the packed, top-down 24-bit BGR the JPEG encoder takes.
     fn to_bgr(&self) -> Result<Vec<u8>, CaptureError> {
+        let mut bgr = Vec::new();
+        self.convert::<3>(&mut bgr)?;
+        Ok(bgr)
+    }
+
+    /// Converts the frame to the packed, top-down BGRA the live preview wants, replacing the
+    /// contents of `bgra`.
+    fn to_bgra(&self, bgra: &mut Vec<u8>) -> Result<(), CaptureError> {
+        self.convert::<4>(bgra)
+    }
+
+    /// Converts the frame into a packed, top-down buffer of `CHANNELS` bytes per pixel,
+    /// replacing its contents; the fourth channel, when asked for, is opaque.
+    fn convert<const CHANNELS: usize>(&self, out: &mut Vec<u8>) -> Result<(), CaptureError> {
         let width = self.width as usize;
         let height = self.height as usize;
         let stride = self.stride.unsigned_abs() as usize;
@@ -1021,11 +1059,12 @@ impl StillFrame {
             )));
         }
 
-        let mut bgr = vec![0u8; width * height * 3];
+        out.clear();
+        out.resize(width * height * CHANNELS, 0);
         let bottom_up = self.stride < 0;
         for row in 0..height {
             let source_row = if bottom_up { height - 1 - row } else { row };
-            let target = &mut bgr[row * width * 3..(row + 1) * width * 3];
+            let target = &mut out[row * width * CHANNELS..(row + 1) * width * CHANNELS];
             match self.format {
                 PixelFormat::Nv12 => {
                     let luma = &self.data[source_row * stride..];
@@ -1033,8 +1072,12 @@ impl StillFrame {
                     let chroma = &self.data[stride * height + (source_row / 2) * stride..];
                     for column in 0..width {
                         let (u, v) = (chroma[column / 2 * 2] as i32, chroma[column / 2 * 2 + 1] as i32);
-                        target[column * 3..column * 3 + 3]
-                            .copy_from_slice(&yuv_to_bgr(luma[column] as i32, u, v));
+                        let pixel = yuv_to_bgr(luma[column] as i32, u, v);
+                        let target = &mut target[column * CHANNELS..];
+                        target[..3].copy_from_slice(&pixel);
+                        if CHANNELS == 4 {
+                            target[3] = u8::MAX;
+                        }
                     }
                 }
                 PixelFormat::Yuy2 => {
@@ -1044,13 +1087,17 @@ impl StillFrame {
                             0 => (line[column * 2] as i32, line[column * 2 + 1] as i32, line[column * 2 + 3] as i32),
                             _ => (line[column * 2] as i32, line[column * 2 - 1] as i32, line[column * 2 + 1] as i32),
                         };
-                        target[column * 3..column * 3 + 3]
-                            .copy_from_slice(&yuv_to_bgr(y, u, v));
+                        let pixel = yuv_to_bgr(y, u, v);
+                        let target = &mut target[column * CHANNELS..];
+                        target[..3].copy_from_slice(&pixel);
+                        if CHANNELS == 4 {
+                            target[3] = u8::MAX;
+                        }
                     }
                 }
             }
         }
-        Ok(bgr)
+        Ok(())
     }
 }
 
