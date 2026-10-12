@@ -40,21 +40,4 @@ post_install do |installer|
   installer.pods_project.targets.each do |target|
     flutter_additional_ios_build_settings(target)
   end
-  # The rust_lib static library drives AVFoundation capture and VideoToolbox
-  # encoding on iOS; nothing else links those frameworks, so the Runner link
-  # fails with undefined _AV*/_CM*/_kVT* symbols without this.
-  installer.aggregate_targets.each do |aggregate|
-    aggregate.user_project.targets.each do |target|
-      next unless target.name == 'Runner'
-      target.build_configurations.each do |config|
-        ldflags = config.build_settings['OTHER_LDFLAGS'] || ['$(inherited)']
-        ldflags = [ldflags] if ldflags.is_a?(String)
-        %w[AVFoundation CoreMedia CoreVideo VideoToolbox].each do |framework|
-          ldflags << '-framework' << framework unless ldflags.include?(framework)
-        end
-        config.build_settings['OTHER_LDFLAGS'] = ldflags
-      end
-    end
-    aggregate.user_project.save
-  end
 end
