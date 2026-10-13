@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:collection';
 
+import 'package:app/src/permissions.dart';
 import 'package:app/src/rust/api.dart';
 import 'package:flutter/widgets.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -475,6 +476,15 @@ class AgentState extends ChangeNotifier {
     _previewEpoch++;
     _notify();
     try {
+      // Android denies the camera to an app the user has not granted it to, and the capture
+      // backend can only report that as a bare permission failure. Ask here, where the answer can
+      // become a sentence the operator can act on.
+      final denied = await CameraPermission.ensureCameraPermission();
+      if (denied != null) {
+        _addLog(denied);
+        _notify();
+        return;
+      }
       await startAgent(
         config: AgentConfig(
           server: serverController.text.trim(),

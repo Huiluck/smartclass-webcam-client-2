@@ -702,12 +702,27 @@ async fn forward_core_events(mut events: UnboundedReceiver<CoreEvent>) {
 }
 
 /// File the `tracing` subscriber appends to.
+///
+/// The platform's temp directory is the right place where it exists, but an Android app process
+/// has `TMPDIR` unset and no `/tmp` to fall back on, so the file belongs beside the client's
+/// other state there. Falling back to the temp directory keeps the desktop behaviour.
 fn log_file_path() -> PathBuf {
-    std::env::temp_dir().join("scwc-agent.log")
+    match config_dir() {
+        Some(dir) => dir.join("agent.log"),
+        None => std::env::temp_dir().join("scwc-agent.log"),
+    }
 }
 
 /// Directory the client keeps its configuration in, when the platform has one.
+///
+/// The host may name one the environment does not: an app sandbox knows its writable directory,
+/// but has no `HOME` for the platform lookup below to find, so the host hands it over through
+/// `SCWC_STORAGE_DIR` and that wins. Without it the platform lookup is the answer, which is
+/// exactly right on the desktops.
 fn config_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("SCWC_STORAGE_DIR") {
+        return Some(PathBuf::from(dir).join("sc-webcam"));
+    }
     dirs::config_dir().map(|dir| dir.join("sc-webcam"))
 }
 

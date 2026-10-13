@@ -3,6 +3,8 @@ package com.example.app
 import android.Manifest
 import android.app.Activity
 import android.content.pm.PackageManager
+import android.os.Bundle
+import android.system.Os
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -17,6 +19,12 @@ import io.flutter.plugin.common.MethodChannel
  * denial the user asked not to be asked about again comes back as `false` as well; Dart turns
  * that into the message that points at Settings.
  *
+ * The activity also names this app's own data directory in the process environment: the client
+ * keeps the server identity, the last capture parameters and its log on disk and asks the
+ * platform where to put them, but an Android app process has no `HOME` for that lookup to find.
+ * The directory the framework hands out is only reachable from the framework side, and the
+ * native code starts after this method runs, so the environment is how it gets there.
+ *
  * The framework's own `checkSelfPermission`/`requestPermissions` are used rather than the
  * AndroidX helpers: they arrived in API 23 and this client's floor is above that, while the
  * AndroidX dependency would be an assumption about what the Flutter embedding brings along.
@@ -30,6 +38,13 @@ class MainActivity : FlutterActivity() {
 
     /** The Dart side's answer, held until the system dialog comes back. */
     private var pending: MethodChannel.Result? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        // Read by the client's own path lookup, which otherwise falls back to the desktop
+        // conventions (`$HOME/.config`) that an app process cannot resolve.
+        Os.setenv("SCWC_STORAGE_DIR", filesDir.absolutePath, true)
+        super.onCreate(savedInstanceState)
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
