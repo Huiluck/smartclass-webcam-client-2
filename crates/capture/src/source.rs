@@ -3,7 +3,8 @@
 //!
 //! The encoded frames go one way — backend callback to core — and the live preview goes the
 //! other: every backend offers the frames it captures to [`scwc_core::preview`], which owns
-//! the sink, the conversion and the scaling.
+//! the sink, the conversion and the scaling. A backend that can hand over its platform's own
+//! buffer does that too, and the core decides which of the two a consumer is waiting for.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -28,22 +29,90 @@ pub(crate) type FrameCallback =
 pub(crate) type JpegCallback =
     unsafe extern "C" fn(user: *mut c_void, data: *const u8, len: usize);
 
+/// Backend entry point for one captured frame handed over as the platform's own buffer.
+///
+/// The Apple shim lends the buffer — a `CVPixelBufferRef` — for the duration of the call, and
+/// only the shim knows what a refcount is on it: a frame the preview keeps is retained through
+/// [`retain_frame_buffer`], a frame it replaces is released through [`release_frame_buffer`], so
+/// no CoreVideo type enters this crate's public surface.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) type FrameSlotCallback =
+    unsafe extern "C" fn(user: *mut c_void, buffer: *mut c_void);
+
+/// The frame-slot callback the Apple shim hands its captured buffers to.
+///
+/// The gate is the core's own: a camera whose frames nobody renders as a platform buffer costs
+/// this a load and a return.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) unsafe extern "C" fn on_native_frame(_user: *mut c_void, buffer: *mut c_void) {
+    if buffer.is_null() || !scwc_core::preview::native_preview_active() {
+        return;
+    }
+    // SAFETY: `buffer` is the buffer the shim lent for the duration of this call; the frame is
+    // retained through the shim, and the one it replaces is released the same way, so the slot
+    // owns exactly one reference to whatever it holds.
+    let retained = unsafe { sys::retain_buffer(buffer) };
+    if let Some(replaced) = scwc_core::preview::publish_native_frame(retained) {
+        // SAFETY: the slot handed back the reference it had retained, and nothing else holds it.
+        unsafe { sys::release_buffer(replaced) };
+    }
+}
+
+/// Retains one frame buffer so a consumer can own what it keeps; release it with
+/// [`release_frame_buffer`].
+///
+/// # Safety
+///
+/// `buffer` is a buffer the capture callback lent — a `CVPixelBufferRef` — and it is still alive:
+/// a buffer may only be retained inside the call that lent it, or from a reference already
+/// retained that way.
+///
+/// A buffer that is null is returned unchanged, so callers need no null check.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub unsafe fn retain_frame_buffer(buffer: *mut c_void) -> *mut c_void {
+    // SAFETY: the caller upholds the contract above.
+    unsafe { sys::retain_buffer(buffer) }
+}
+
+/// Releases one reference to a buffer retained by [`retain_frame_buffer`].
+///
+/// # Safety
+///
+/// `buffer` came from [`retain_frame_buffer`] (or from [`scwc_core::preview::take_native_frame`],
+/// which hands on such a reference) and has not been released yet. Nothing may use the buffer
+/// after this returns.
+///
+/// A buffer that is null is ignored, so callers need no null check.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub unsafe fn release_frame_buffer(buffer: *mut c_void) {
+    // SAFETY: the caller upholds the contract above.
+    unsafe { sys::release_buffer(buffer) };
+}
+
 /// Backend entry point for one live preview frame: tightly packed BGRA, `width * height` of them.
 ///
-/// The Apple shim hands a frame over this way, having already rendered it into the layout the
-/// core wants — CoreVideo's buffers carry row padding the core knows nothing about. The Linux
-/// and Windows backends convert their frames in this crate and reach
+/// The Apple shim hands a frame over this way, having already rendered it at the size
+/// [`preview_wanted`] asked for — CoreVideo's buffers carry row padding the core knows nothing
+/// about. The Linux and Windows backends convert their frames in this crate and reach
 /// [`scwc_core::preview::publish_bgra`] directly.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(crate) type PreviewCallback =
     unsafe extern "C" fn(user: *mut c_void, data: *const u8, len: usize, width: u32, height: u32);
 
-/// Backend entry point a backend asks whether preview frames are wanted at all.
+/// Backend entry point a backend asks where to render the next preview frame, if anywhere.
 ///
 /// A conversion reads the whole frame, so a backend that can skip it cheaply — the Apple shim
-/// renders the frame into BGRA for every preview it produces — asks this first.
+/// renders the frame with CoreImage for every preview it produces — asks this first, with the
+/// frame it holds. Non-zero means one is wanted, and the size to render at is written to
+/// `out_width`/`out_height`; zero means the backend must do nothing at all.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-pub(crate) type PreviewWanted = unsafe extern "C" fn(user: *mut c_void) -> i32;
+pub(crate) type PreviewWanted = unsafe extern "C" fn(
+    user: *mut c_void,
+    frame_width: u32,
+    frame_height: u32,
+    out_width: *mut u32,
+    out_height: *mut u32,
+) -> i32;
 
 /// The preview callback the Apple shim hands its frames to.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -63,21 +132,49 @@ pub(crate) unsafe extern "C" fn on_preview(
     scwc_core::preview::publish_bgra(pixels, width, height);
 }
 
-/// Whether a preview is wanted right now; see [`scwc_core::preview::preview_enabled`].
+/// Where the next preview frame should be rendered, if anywhere; see
+/// [`scwc_core::preview::next_frame_size`].
+///
+/// This is the gate the Apple shim consults on the capture queue for every captured frame, so it
+/// does nothing but look at the core's state and do a little arithmetic.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-pub(crate) unsafe extern "C" fn preview_wanted(_user: *mut c_void) -> i32 {
-    i32::from(scwc_core::preview::preview_enabled())
+pub(crate) unsafe extern "C" fn preview_wanted(
+    _user: *mut c_void,
+    frame_width: u32,
+    frame_height: u32,
+    out_width: *mut u32,
+    out_height: *mut u32,
+) -> i32 {
+    let Some((width, height)) = scwc_core::preview::next_frame_size(frame_width, frame_height)
+    else {
+        return 0;
+    };
+    if !out_width.is_null() {
+        // SAFETY: the caller promises both out-parameters point at a `uint32_t`.
+        unsafe { *out_width = width };
+    }
+    if !out_height.is_null() {
+        // SAFETY: as above.
+        unsafe { *out_height = height };
+    }
+    1
 }
+
+/// How long a keyframe keeps retrying for space in the queue before it is dropped anyway.
+///
+/// The retry runs on the backend's own callback thread, and a blocked one back-pressures the
+/// whole capture path: VideoToolbox stops accepting frames, the capture delegate blocks inside
+/// `EncodeFrame`, and the frames nobody sees any more — the preview included — arrive in a burst
+/// once it unblocks. Measured on a machine with the camera in standby, the old budget (1000
+/// tries, two seconds) held a delegate call for 1960ms and the preview was short by 1988ms per
+/// occurrence, so the window has to be small: it is there to ride out a consumer that is behind
+/// by a frame or two, not to wait for one that is not reading at all. That case ends the same
+/// way it did before — the keyframe is dropped, a warning is logged, and the consumer gets its
+/// keyframe from the next GOP.
+const KEYFRAME_RETRY_WINDOW: Duration = Duration::from_millis(50);
 
 /// How long a keyframe waits for space in the queue before retrying.
 const KEYFRAME_RETRY_DELAY: Duration = Duration::from_millis(2);
-
-/// How often a keyframe retries before it is dropped anyway.
-///
-/// The wait has to end: the callback blocks a backend thread that teardown joins, so a
-/// consumer that never drains its queue would otherwise deadlock the shutdown. At two
-/// seconds a full queue already means the core is not reading.
-const KEYFRAME_RETRY_LIMIT: usize = 1000;
 
 /// Data shared with the backend callbacks through the `user` pointer.
 ///
@@ -156,20 +253,22 @@ pub(crate) unsafe extern "C" fn on_frame(
                 return;
             }
             let mut frame = frame;
-            for attempt in 0..KEYFRAME_RETRY_LIMIT {
+            let deadline = std::time::Instant::now() + KEYFRAME_RETRY_WINDOW;
+            loop {
                 match state.frames.try_send(frame) {
                     Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => return,
                     Err(mpsc::error::TrySendError::Full(returned)) => {
                         frame = returned;
-                        if attempt + 1 < KEYFRAME_RETRY_LIMIT {
-                            std::thread::sleep(KEYFRAME_RETRY_DELAY);
+                        if std::time::Instant::now() >= deadline {
+                            break;
                         }
+                        std::thread::sleep(KEYFRAME_RETRY_DELAY);
                     }
                 }
             }
-            // Rate-limit: standby keeps the camera encoding with no consumer, so a
-            // permanently full queue is expected there and must not spam the log
-            // (or the UI event stream, which forwards every warning).
+            // Rate-limit: a camera that keeps encoding with no consumer reading has a
+            // permanently full queue, which must not spam the log (or the UI event
+            // stream, which forwards every warning).
             let mut last = state
                 .last_full_warning
                 .lock()
@@ -276,6 +375,10 @@ impl FrameSource for CaptureSource {
             Some(jpeg) => Ok(jpeg),
             None => Err(SourceError::from("capture pipeline stopped before the photo")),
         }
+    }
+
+    fn set_encoding(&mut self, enabled: bool) {
+        self.handle.set_encoding(enabled);
     }
 
     fn preferred_codec(&self) -> Codec {

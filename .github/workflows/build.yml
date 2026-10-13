@@ -16,6 +16,12 @@ jobs:
     # target (cross via cargo-xwin: clang-cl + the MSVC SDK fetched by xwin,
     # no Windows runner/container needed).
     runs-on: ubuntu-latest
+    env:
+      # cargo-xwin otherwise splats the MSVC SDK into ./.xwin-cache (project
+      # local), which never lands in the actions/cache entry below; pin the
+      # splat into the cached directory. Absolute path: the runner does not
+      # expand ~ in env values.
+      XWIN_CACHE_DIR: /home/runner/.cache/xwin
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -44,7 +50,7 @@ jobs:
           path: |
             ~/.cargo/bin/cargo-xwin
             ~/.cache/xwin
-          key: xwin-0.23.1-${{ runner.os }}-${{ runner.arch }}
+          key: xwin-v3-0.23.1-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install cargo-xwin (static musl binary)
         if: steps.xwin-cache.outputs.cache-hit != 'true'

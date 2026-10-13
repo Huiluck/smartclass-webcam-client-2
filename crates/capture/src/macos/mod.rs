@@ -15,7 +15,10 @@ use scwc_protocol::Codec;
 use tracing::{error, info, warn};
 
 use crate::error::CaptureError;
-use crate::source::{FrameCallback, JpegCallback, PreviewCallback, PreviewWanted, on_preview, preview_wanted};
+use crate::source::{
+    FrameCallback, FrameSlotCallback, JpegCallback, PreviewCallback, PreviewWanted,
+    on_native_frame, on_preview, preview_wanted,
+};
 use crate::{CameraInfo, CaptureConfig};
 
 /// The shim's success code.
@@ -94,6 +97,20 @@ unsafe extern "C" {
         user: *mut c_void,
         wanted: Option<PreviewWanted>,
     ) -> i32;
+    /// `cb` is null to unregister.
+    fn scwc_mac_set_frame_slot_cb(
+        handle: *mut c_void,
+        cb: Option<FrameSlotCallback>,
+        user: *mut c_void,
+    ) -> i32;
+    /// Retains the buffer the frame-slot callback lent, so Rust can own one without knowing
+    /// CoreVideo; a null buffer is returned unchanged.
+    fn scwc_mac_retain_buffer(buffer: *mut c_void) -> *mut c_void;
+    /// Releases one reference to a buffer retained that way.
+    fn scwc_mac_release_buffer(buffer: *mut c_void);
+    /// Turns the hardware encoder on or off: off, the delegate publishes preview frames and does
+    /// not encode; on, the first frame after the call is an IDR.
+    fn scwc_mac_set_encoding(handle: *mut c_void, enabled: i32) -> i32;
     fn scwc_mac_set_params(
         handle: *mut c_void,
         width: u32,
@@ -171,9 +188,46 @@ impl Handle {
             handle.close();
             return Err(error);
         }
+        // A consumer that renders the camera's own buffer is served from the same frame, with
+        // nothing converted at all. The callback is always registered and asks the core whether
+        // anything wants a buffer, so a consumer arriving later needs no re-registration either.
+        if let Err(error) =
+            handle.set_frame_slot_callback(Some(on_native_frame), ptr::null_mut())
+        {
+            handle.close();
+            return Err(error);
+        }
         Ok(handle)
     }
 
+    /// Registers the shim's frame-slot callback, which hands the platform's own buffers over;
+    /// `None` unregisters it.
+    fn set_frame_slot_callback(
+        &self,
+        cb: Option<FrameSlotCallback>,
+        user: *mut c_void,
+    ) -> Result<(), CaptureError> {
+        // SAFETY: as in `set_preview_callback`; the callback is a `'static` function that never
+        // unwinds, so no panic can cross into the shim, and the buffers it is lent are only
+        // touched through the shim's own retain and release.
+        let status = unsafe { scwc_mac_set_frame_slot_cb(self.raw, cb, user) };
+        if status != OK {
+            return Err(last_error());
+        }
+        Ok(())
+    }
+
+    /// Tells the shim whether to run the hardware encoder.
+    ///
+    /// A failure here is not worth an error: the encoder staying on only costs power, and the
+    /// capture path keeps working either way.
+    pub(crate) fn set_encoding(&self, enabled: bool) {
+        // SAFETY: the handle is live for the life of the wrapper, as in every other call here.
+        let status = unsafe { scwc_mac_set_encoding(self.raw, i32::from(enabled)) };
+        if status != OK {
+            warn!(%status, "the capture backend refused to change its encoding state");
+        }
+    }
     /// Registers the shim's preview callback and its gate; `None` unregisters both.
     fn set_preview_callback(
         &self,
@@ -383,4 +437,28 @@ unsafe fn c_string(value: *const c_char) -> String {
     unsafe { CStr::from_ptr(value) }
         .to_string_lossy()
         .into_owned()
+}
+
+/// Retains one buffer the frame-slot callback lent, through the shim, so that Rust can own a
+/// frame without knowing CoreVideo; a null buffer is returned unchanged.
+///
+/// # Safety
+///
+/// `buffer` is a buffer the capture callback lent, or a reference already retained this way and
+/// still alive.
+pub(crate) unsafe fn retain_buffer(buffer: *mut c_void) -> *mut c_void {
+    // SAFETY: `buffer` is a buffer the capture callback lent or an already retained reference, as
+    // this module's callers guarantee; retaining a reference that is alive is safe.
+    unsafe { scwc_mac_retain_buffer(buffer) }
+}
+
+/// Releases one reference to a buffer retained by [`retain_buffer`]; a null buffer is ignored.
+///
+/// # Safety
+///
+/// The caller owns exactly the reference it hands over, and nothing uses the buffer afterwards.
+pub(crate) unsafe fn release_buffer(buffer: *mut c_void) {
+    // SAFETY: the caller owns exactly the reference it hands over, as this module's callers
+    // guarantee, and nothing uses the buffer afterwards.
+    unsafe { scwc_mac_release_buffer(buffer) };
 }
