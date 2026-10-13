@@ -29,6 +29,10 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, error, info};
 
+use super::image_reader::{
+    AImage, AImageReader, AImageReader_acquireNextImage, AImageReader_delete,
+    AImageReader_getWindow, AImageReader_new, AImage_delete, AImage_getPlaneData,
+};
 use super::native_window::ANativeWindow;
 use crate::error::CaptureError;
 
@@ -40,7 +44,7 @@ pub(crate) const IMAGE_FORMAT_JPEG: i32 = 0x100;
 /// The still path acquires one image per `take_photo` and deletes it before returning, so two
 /// is already one more than is ever held: a second buffer lets the camera write the next
 /// capture while the previous one is being copied out, without the producer ever blocking.
-const MAX_IMAGES: i32 = 2;
+pub(crate) const MAX_IMAGES: i32 = 2;
 
 /// How long to wait between polls while the camera has not written a buffer yet.
 ///
@@ -50,7 +54,7 @@ const MAX_IMAGES: i32 = 2;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// `AMEDIA_OK`: the call succeeded.
-const AMEDIA_OK: c_int = 0;
+pub(crate) const AMEDIA_OK: c_int = 0;
 /// `AMEDIA_ERROR_BASE`: the first of the negative media codes.
 const AMEDIA_ERROR_BASE: c_int = -10_000;
 /// `AMEDIA_ERROR_UNKNOWN`.
@@ -62,7 +66,7 @@ const AMEDIA_ERROR_UNSUPPORTED: c_int = AMEDIA_ERROR_BASE - 2;
 /// `AMEDIA_ERROR_INVALID_OBJECT`: the reader behind the image is gone.
 const AMEDIA_ERROR_INVALID_OBJECT: c_int = AMEDIA_ERROR_BASE - 3;
 /// `AMEDIA_ERROR_INVALID_PARAMETER`: a geometry the platform will not accept.
-const AMEDIA_ERROR_INVALID_PARAMETER: c_int = AMEDIA_ERROR_BASE - 4;
+pub(crate) const AMEDIA_ERROR_INVALID_PARAMETER: c_int = AMEDIA_ERROR_BASE - 4;
 /// `AMEDIA_ERROR_INVALID_OPERATION`.
 const AMEDIA_ERROR_INVALID_OPERATION: c_int = AMEDIA_ERROR_BASE - 5;
 /// `AMEDIA_ERROR_IO`.
@@ -72,7 +76,7 @@ const AMEDIA_ERROR_WOULD_BLOCK: c_int = AMEDIA_ERROR_BASE - 8;
 /// `AMEDIA_IMGREADER_ERROR_BASE`: the first of the image reader's codes.
 const AMEDIA_IMGREADER_ERROR_BASE: c_int = -30_000;
 /// `AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE`: no buffer has been written yet.
-const AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE: c_int = AMEDIA_IMGREADER_ERROR_BASE - 1;
+pub(crate) const AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE: c_int = AMEDIA_IMGREADER_ERROR_BASE - 1;
 /// `AMEDIA_IMGREADER_MAX_IMAGES_ACQUIRED`: all `maxImages` images are still held.
 const AMEDIA_IMGREADER_MAX_IMAGES_ACQUIRED: c_int = AMEDIA_IMGREADER_ERROR_BASE - 2;
 /// `AMEDIA_IMGREADER_CANNOT_LOCK_IMAGE`: the image could not be mapped for CPU access.
@@ -82,18 +86,6 @@ const AMEDIA_IMGREADER_CANNOT_LOCK_IMAGE: c_int = AMEDIA_IMGREADER_ERROR_BASE - 
 const JPEG_SOI: [u8; 2] = [0xFF, 0xD8];
 /// The JPEG end-of-image marker (`FF D9`) every still ends with.
 const JPEG_EOI: [u8; 2] = [0xFF, 0xD9];
-
-/// Opaque `AImageReader` (`media/NdkImageReader.h`).
-#[repr(C)]
-pub(crate) struct AImageReader {
-    _private: [u8; 0],
-}
-
-/// Opaque `AImage` (`media/NdkImage.h`).
-#[repr(C)]
-pub(crate) struct AImage {
-    _private: [u8; 0],
-}
 
 /// The JPEG output of one camera.
 pub(crate) struct StillCapture {
@@ -286,7 +278,7 @@ fn read_plane(image: *mut AImage) -> Result<Vec<u8>, CaptureError> {
 }
 
 /// The header's symbolic name for a `media_status_t`, for logs.
-fn status_name(status: c_int) -> &'static str {
+pub(crate) fn status_name(status: c_int) -> &'static str {
     match status {
         AMEDIA_OK => "AMEDIA_OK",
         AMEDIA_ERROR_UNKNOWN => "AMEDIA_ERROR_UNKNOWN",
@@ -308,7 +300,7 @@ fn status_name(status: c_int) -> &'static str {
 ///
 /// Mirrors the media and camera2 helpers: the message carries both the call and the numeric
 /// status, so a failure on a device is diagnosable from the client's log alone.
-fn status_error(operation: &str, status: c_int) -> CaptureError {
+pub(crate) fn status_error(operation: &str, status: c_int) -> CaptureError {
     let name = status_name(status);
     error!(code = status, status = name, "{operation}");
     CaptureError::Os(format!("{operation}: {name} ({status})"))
@@ -329,28 +321,4 @@ fn verify_jpeg(bytes: &[u8]) -> Result<(), CaptureError> {
         "the still is not a complete JPEG: {} bytes without both SOI and EOI markers",
         bytes.len()
     )))
-}
-
-// The reader and the image it hands out live in `libmediandk`, which `media.rs` already
-// links; the entry points are declared here because the still path is the only reader of
-// them.
-#[link(name = "mediandk")]
-unsafe extern "C" {
-    fn AImageReader_new(
-        width: i32,
-        height: i32,
-        format: i32,
-        max_images: i32,
-        reader: *mut *mut AImageReader,
-    ) -> c_int;
-    fn AImageReader_delete(reader: *mut AImageReader);
-    fn AImageReader_getWindow(reader: *mut AImageReader, window: *mut *mut ANativeWindow) -> c_int;
-    fn AImageReader_acquireNextImage(reader: *mut AImageReader, image: *mut *mut AImage) -> c_int;
-    fn AImage_delete(image: *mut AImage);
-    fn AImage_getPlaneData(
-        image: *const AImage,
-        plane_index: c_int,
-        data: *mut *mut u8,
-        data_length: *mut c_int,
-    ) -> c_int;
 }

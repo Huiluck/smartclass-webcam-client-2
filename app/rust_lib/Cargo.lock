@@ -1288,7 +1288,6 @@ name = "scwc-core"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "dirs",
  "futures-util",
  "reqwest",
  "rustls 0.23.45",

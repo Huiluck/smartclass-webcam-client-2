@@ -48,6 +48,10 @@ pub(crate) struct Session {
     still_target: *mut ACameraOutputTarget,
     /// The session's output for the still window.
     still_output: *mut ACaptureSessionOutput,
+    /// The output target for the preview window, added to the repeating request.
+    preview_target: *mut ACameraOutputTarget,
+    /// The session's output for the preview window.
+    preview_output: *mut ACaptureSessionOutput,
     /// The container the session was created from.
     container: *mut ACaptureSessionOutputContainer,
     /// The callbacks the framework keeps a pointer to; they have to outlive the session.
@@ -71,6 +75,7 @@ impl Session {
         device: &mut camera2::Device,
         window: *mut ANativeWindow,
         still: Option<*mut ANativeWindow>,
+        preview: Option<*mut ANativeWindow>,
         fps: u32,
     ) -> Result<Self, CaptureError> {
         let device_ptr = device
@@ -87,6 +92,8 @@ impl Session {
             still_request: ptr::null_mut(),
             still_target: ptr::null_mut(),
             still_output: ptr::null_mut(),
+            preview_target: ptr::null_mut(),
+            preview_output: ptr::null_mut(),
             container: ptr::null_mut(),
             callbacks: Box::new(ACameraCaptureSession_stateCallbacks {
                 // No shared state yet: the pump reads frames from the encoder, and the camera
@@ -112,6 +119,11 @@ impl Session {
             session.still_output = still_output;
             camera2::output_container_add(container, still_output)?;
         }
+        if let Some(preview_window) = preview {
+            let preview_output = camera2::output_create(preview_window)?;
+            session.preview_output = preview_output;
+            camera2::output_container_add(container, preview_output)?;
+        }
 
         // The session, which is created from the container.
         // SAFETY: the device is open, the container is live and the callbacks are owned by
@@ -128,6 +140,15 @@ impl Session {
         let target = camera2::output_target_create(window)?;
         session.target = target;
         camera2::request_add_target(request, target)?;
+
+        // The preview rides in the repeating request, so every frame the encoder gets is also
+        // rendered into the preview reader's window: what the interface shows is what is being
+        // recorded, and the capture path never waits on it.
+        if let Some(preview_window) = preview {
+            let preview_target = camera2::output_target_create(preview_window)?;
+            session.preview_target = preview_target;
+            camera2::request_add_target(request, preview_target)?;
+        }
 
         // The still request, targeting only the still window: it is submitted by
         // `capture_still` and must not bring the encoder surface into the same request, which
@@ -229,6 +250,17 @@ impl Drop for Session {
             // belongs to the still reader, which outlives this session.
             unsafe { camera2::output_free(self.still_output) };
             self.still_output = ptr::null_mut();
+        }
+        if !self.preview_target.is_null() {
+            // SAFETY: as in `target`, for the preview window's target.
+            unsafe { camera2::output_target_free(self.preview_target) };
+            self.preview_target = ptr::null_mut();
+        }
+        if !self.preview_output.is_null() {
+            // SAFETY: as in `output`, for the preview window's session output. The window
+            // belongs to the preview reader, which outlives this session.
+            unsafe { camera2::output_free(self.preview_output) };
+            self.preview_output = ptr::null_mut();
         }
         if !self.container.is_null() {
             // SAFETY: as above, for the container.

@@ -58,8 +58,10 @@
 //! suspected of being wedged, and expect the HAL, not the client, to be the story.
 
 mod camera2;
+mod image_reader;
 mod media;
 mod native_window;
+mod preview;
 mod session;
 mod still;
 
@@ -72,6 +74,7 @@ use scwc_protocol::Codec;
 use tracing::{debug, error, info, warn};
 
 use self::camera2::{ACameraDevice_StateCallbacks, LensFacing, Manager, Metadata};
+use self::preview::PreviewCapture;
 use self::still::StillCapture;
 use crate::camera_matrix::{fps_by_resolution, fps_ranges};
 use crate::error::CaptureError;
@@ -284,6 +287,16 @@ unsafe impl Send for Handle {}
 
 /// One request from the owning thread to the capture thread.
 enum Command {
+    /// Tells the capture thread whether a consumer is taking frames.
+    ///
+    /// Android's capture session writes into the encoder's surface whether or not anyone reads
+    /// the result, so this cannot stop encoding the way macOS stops its own encoder; what it does
+    /// is make a stream that starts now begin on a keyframe, so the core does not have to wait
+    /// out an I-frame interval before the first decodable frame.
+    SetEncoding {
+        /// Whether a consumer is taking frames.
+        enabled: bool,
+    },
     /// Rebuild the pipeline with these capture and encoder parameters.
     SetParameters {
         /// Requested picture width in pixels.
@@ -452,10 +465,15 @@ impl Handle {
         }
     }
 
-    /// Stops capturing and releases the camera.
+    /// Tells the capture thread whether a consumer is taking frames.
     ///
-    /// Joins the capture thread, which drops the whole pipeline in the order that keeps the
-    /// framework's references valid.
+    /// Returns without waiting: the capture thread picks the request up at its next loop
+    /// boundary, and nothing in the caller depends on the keyframe having been produced yet.
+    pub(crate) fn set_encoding(&self, enabled: bool) {
+        self.send(Command::SetEncoding { enabled });
+    }
+
+    /// Stops capturing and releases the camera.
     pub(crate) fn close(&mut self) {
         // A send failure means the thread already left, which is not an error here.
         self.send(Command::Stop);
@@ -513,6 +531,15 @@ fn pump(setup: Setup, requests: Receiver<Command>, ready: SyncSender<Result<(), 
                 let outcome = pipeline.rebuild(&cfg);
                 let _ = reply.send(outcome);
             }
+            Ok(Command::SetEncoding { enabled }) => {
+                if enabled {
+                    // The core only turns encoding on when a stream is about to start, and a
+                    // stream that begins mid-GOP cannot be decoded until the next IDR.
+                    if let Some(stream) = pipeline.stream.as_mut() {
+                        stream.encoder.request_keyframe();
+                    }
+                }
+            }
             Ok(Command::TakePhoto { cb, user, reply }) => {
                 let outcome = pipeline.take_photo(cb, user.0);
                 let _ = reply.send(outcome);
@@ -527,6 +554,13 @@ fn pump(setup: Setup, requests: Receiver<Command>, ready: SyncSender<Result<(), 
             warn!("the Android capture stream is down; the client will report no more frames");
             break;
         };
+
+        // The preview reads whatever the camera last wrote into its window. It takes at most one
+        // frame per loop and converts nothing while the UI shows no preview, so it neither waits
+        // for the encoder nor costs a pass nobody asked for.
+        if let Some(preview) = stream.preview.as_mut() {
+            preview.publish();
+        }
 
         match stream.encoder.next_access_unit(DEQUEUE_TIMEOUT_US) {
             Ok(Some(unit)) => {
@@ -566,6 +600,8 @@ struct Stream {
     encoder: media::Encoder,
     /// The JPEG reader `take_photo` reads from, when the camera accepted one.
     still: Option<StillCapture>,
+    /// The YUV reader the preview frames come from, when the camera accepted one.
+    preview: Option<PreviewCapture>,
 }
 
 impl Stream {
@@ -593,18 +629,59 @@ impl Stream {
                 None
             }
         };
+        // The preview output is best-effort for the same reason: a camera that will not carry a
+        // third output loses the interface's picture, not the stream. The frames are only read
+        // while the UI is showing a preview, so the output costs a session combination, not a
+        // conversion, when nothing is watching.
+        let mut preview = match PreviewCapture::new(cfg.width, cfg.height) {
+            Ok(preview) => Some(preview),
+            Err(error) => {
+                warn!(%error, "no preview output for this Android stream; the preview will stay empty");
+                None
+            }
+        };
         let still_window = still.as_ref().map(StillCapture::window);
+        let preview_window = preview.as_ref().map(PreviewCapture::window);
         let session = match session::Session::start(
             device,
             encoder.input_surface(),
             still_window,
+            preview_window,
             cfg.fps,
         ) {
             Ok(session) => session,
+            // A camera may refuse the combination of outputs while accepting a subset of them,
+            // and the stream is the thing that must survive: the preview goes first, then the
+            // still, and the encoder alone is the combination every camera carries.
+            Err(error) if preview_window.is_some() => {
+                warn!(%error, "the camera refused the preview output; rebuilding the session without it");
+                preview = None;
+                match session::Session::start(
+                    device,
+                    encoder.input_surface(),
+                    still_window,
+                    None,
+                    cfg.fps,
+                ) {
+                    Ok(session) => session,
+                    Err(error) if still_window.is_some() => {
+                        warn!(%error, "the camera refused the still output too; rebuilding the session with the encoder alone");
+                        still = None;
+                        session::Session::start(
+                            device,
+                            encoder.input_surface(),
+                            None,
+                            None,
+                            cfg.fps,
+                        )?
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             Err(error) if still_window.is_some() => {
                 warn!(%error, "the camera refused the still output; rebuilding the session without it");
                 still = None;
-                session::Session::start(device, encoder.input_surface(), None, cfg.fps)?
+                session::Session::start(device, encoder.input_surface(), None, None, cfg.fps)?
             }
             Err(error) => return Err(error),
         };
@@ -613,6 +690,7 @@ impl Stream {
             session,
             encoder,
             still,
+            preview,
         })
     }
 }

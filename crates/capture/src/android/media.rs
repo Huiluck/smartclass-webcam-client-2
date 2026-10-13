@@ -249,6 +249,10 @@ unsafe extern "C" {
     fn AMediaCodec_getOutputFormat(codec: *mut AMediaCodec) -> *mut AMediaFormat;
 
     fn AMediaFormat_new() -> *mut AMediaFormat;
+    fn AMediaCodec_setParameters(
+        codec: *mut AMediaCodec,
+        params: *const AMediaFormat,
+    ) -> c_int;
     fn AMediaFormat_delete(format: *mut AMediaFormat) -> c_int;
     fn AMediaFormat_setInt32(format: *mut AMediaFormat, name: *const c_char, value: i32);
     fn AMediaFormat_setString(
@@ -540,6 +544,34 @@ impl Encoder {
     /// pointer stays good even if the codec is torn down first.
     pub(crate) fn input_surface(&self) -> *mut ANativeWindow {
         self.input_surface
+    }
+
+    /// Asks the running encoder for a keyframe.
+    ///
+    /// `AMediaCodec` starts a stream in the middle of a GOP, so a consumer that attaches to an
+    /// already-running encoder cannot decode anything until the next IDR arrives — up to the
+    /// configured interval away. Requesting a sync frame at that moment is what
+    /// [`FrameSource::set_encoding`](scwc_core::FrameSource::set_encoding) asks for when it
+    /// re-enables encoding: the next unit the codec produces is then an IDR.
+    ///
+    /// The request is best-effort in the same way a bitrate change is: a codec may ignore a
+    /// parameter it cannot honour, and that is not a failure of the capture path.
+    pub(crate) fn request_keyframe(&mut self) {
+        if self.codec.is_null() || !self.started {
+            return;
+        }
+        let Some(params) = MediaFormat::new() else {
+            return;
+        };
+        // The platform's own key for `AMediaCodec`'s parameter-set: `PARAMETER_KEY_REQUEST_SYNC_FRAME`,
+        // whose value is documented as "request a sync frame"; it is read as a value, not a flag.
+        const KEY_REQUEST_SYNC_FRAME: &CStr = c"request-sync-frame";
+        params.set_int32_str(KEY_REQUEST_SYNC_FRAME, 0);
+        // SAFETY: the codec is live and started, and `params` outlives the call.
+        let status = unsafe { AMediaCodec_setParameters(self.codec, params.as_ptr()) };
+        if status != STATUS_OK {
+            debug!(status, "the encoder did not take the keyframe request");
+        }
     }
 
     /// Moves the codec to Executing (`AMediaCodec_start`).
@@ -865,6 +897,16 @@ impl MediaFormat {
         // SAFETY: the format is live, and `name` is an `AMEDIAFORMAT_KEY_*` extern static read
         // for the value the loader put there before `main`, which the platform never changes.
         unsafe { AMediaFormat_setInt32(self.ptr, key(name), value) };
+    }
+
+    /// Stores an integer entry under a key spelled as a C string.
+    ///
+    /// For the keys this crate states itself rather than reads from the platform (see
+    /// [`Encoder::request_keyframe`]): the NDK exports a symbol for each `AMEDIAFORMAT_KEY_*`,
+    /// but nothing for `AMediaCodec`'s parameter keys, whose values are the documented strings.
+    fn set_int32_str(&self, name: &CStr, value: i32) {
+        // SAFETY: the format is live, and `name` is a NUL-terminated key that outlives the call.
+        unsafe { AMediaFormat_setInt32(self.ptr, name.as_ptr(), value) };
     }
 
     /// Reads a byte-array entry, or an empty vector when it is absent or of another type.
