@@ -89,6 +89,20 @@ use crate::{CameraInfo, CaptureConfig};
 /// only publish theirs for the sizes their own camera app records).
 const VIDEO_FORMATS: [i32; 2] = [camera2::IMAGE_FORMAT_PRIVATE, camera2::IMAGE_FORMAT_YUV_420_888];
 
+/// The clockwise turn the preview needs so the picture stands up in the interface.
+///
+/// The sensor reports how far its scanlines are rotated from the device's natural orientation —
+/// 0, 90, 180 or 270. The interface is a portrait window in the common case, so a sensor mounted
+/// at 90° (this backend's development device) delivers a landscape buffer that has to come back
+/// a quarter turn. The still and video paths are deliberately left alone: the protocol has no
+/// orientation field, and turning them would misreport what the camera produced.
+fn rotation_degrees(characteristics: &Metadata) -> u16 {
+    match characteristics.sensor_orientation() {
+        Some(degrees) if degrees > 0 => (degrees as u16) % 360,
+        _ => 0,
+    }
+}
+
 /// What one camera says it can stream, read from its static characteristics.
 ///
 /// The list is the camera's *claim*: vendors misreport what their hardware sustains, which
@@ -605,8 +619,12 @@ struct Stream {
 }
 
 impl Stream {
-    /// Brings up the chain: encoder, still reader, session.
-    fn start(device: &mut camera2::Device, cfg: &CaptureConfig) -> Result<Self, CaptureError> {
+    /// Brings up the chain: encoder, still reader, preview reader, session.
+    fn start(
+        device: &mut camera2::Device,
+        cfg: &CaptureConfig,
+        characteristics: &Metadata,
+    ) -> Result<Self, CaptureError> {
         // The encoder first: the session needs the surface its codec was configured with, and
         // starting the codec before the camera writes into it is what keeps the first frames
         // from arriving at a codec that is not running yet.
@@ -633,7 +651,11 @@ impl Stream {
         // third output loses the interface's picture, not the stream. The frames are only read
         // while the UI is showing a preview, so the output costs a session combination, not a
         // conversion, when nothing is watching.
-        let mut preview = match PreviewCapture::new(cfg.width, cfg.height) {
+        let mut preview = match PreviewCapture::new(
+            cfg.width,
+            cfg.height,
+            rotation_degrees(&characteristics),
+        ) {
             Ok(preview) => Some(preview),
             Err(error) => {
                 warn!(%error, "no preview output for this Android stream; the preview will stay empty");
@@ -754,7 +776,7 @@ impl Pipeline {
             on_error: Some(on_error),
         });
         let mut device = manager.open(&camera_id, &mut callbacks)?;
-        let stream = Stream::start(&mut device, cfg)?;
+        let stream = Stream::start(&mut device, cfg, &characteristics)?;
 
         let pipeline = Self {
             stream: Some(stream),
@@ -792,7 +814,7 @@ impl Pipeline {
 
         let previous = self.cfg.clone();
         self.stream = None;
-        match Stream::start(&mut self.device, cfg) {
+        match Stream::start(&mut self.device, cfg, &self.characteristics) {
             Ok(stream) => {
                 self.stream = Some(stream);
                 self.cfg = cfg.clone();
@@ -808,7 +830,7 @@ impl Pipeline {
             }
             Err(error) => {
                 warn!(%error, "the requested Android capture parameters failed; restoring the previous stream");
-                match Stream::start(&mut self.device, &previous) {
+                match Stream::start(&mut self.device, &previous, &self.characteristics) {
                     Ok(stream) => {
                         self.stream = Some(stream);
                     }
