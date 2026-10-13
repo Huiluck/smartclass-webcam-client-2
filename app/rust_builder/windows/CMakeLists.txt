@@ -49,7 +49,12 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE flutter flutter_wrapper_plugin)
 # (`app/rust_lib/src/lib.rs`) — is built by cargokit and linked into the plugin, through its import
 # library: the texture path's frames are the ones the bridge would have carried, and its symbols are
 # the same ones the Dart side reaches through that library.
-apply_cargokit(${PLUGIN_NAME} ../../rust_lib rust_lib "scwc_preview_latest_rgba")
+# The crate lives in `app/rust_lib`, one level above this plugin's directory — but this file is
+# compiled through the junction Flutter points at the plugin
+# (`app/windows/flutter/ephemeral/.plugin_symlinks/rust_lib/windows`), and on Windows CMake keeps
+# that path as-is instead of resolving it, so the crate is six levels up from here. (On Linux, where
+# the symlink is resolved, the plugin's CMakeLists walks the two levels up to `app`.)
+apply_cargokit(${PLUGIN_NAME} ../../../../../../rust_lib rust_lib "scwc_preview_latest_rgba")
 
 # List of absolute paths to libraries that should be bundled with the plugin.
 # This list could contain prebuilt libraries, or libraries created by an
