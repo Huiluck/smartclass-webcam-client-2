@@ -574,6 +574,37 @@ impl Encoder {
         }
     }
 
+    /// Tells the running codec whether to produce output at all.
+    ///
+    /// `AMediaCodec`'s `PARAMETER_KEY_SUSPEND` is the one non-destructive gate this platform
+    /// offers: the camera keeps rendering into the encoder's input surface — it has to, the
+    /// session's outputs are fixed — but a suspended codec consumes those frames without
+    /// encoding them, so a pipeline with no consumer stops paying for an encoder and stops
+    /// feeding the core's queue with units nobody takes. Resuming produces a keyframe first,
+    /// which is what a stream starting now needs.
+    ///
+    /// Best-effort like the keyframe request: a codec that ignores the parameter keeps
+    /// encoding, which costs power and nothing else.
+    pub(crate) fn set_suspended(&mut self, suspended: bool) {
+        if self.codec.is_null() || !self.started {
+            return;
+        }
+        let Some(params) = MediaFormat::new() else {
+            return;
+        };
+        // The platform's own key for `AMediaCodec`'s parameter-set:
+        // `PARAMETER_KEY_SUSPEND`, non-zero to suspend and zero to resume.
+        const KEY_SUSPEND: &CStr = c"suspend";
+        params.set_int32_str(KEY_SUSPEND, i32::from(suspended));
+        // SAFETY: the codec is live and started, and `params` outlives the call.
+        let status = unsafe { AMediaCodec_setParameters(self.codec, params.as_ptr()) };
+        if status != STATUS_OK {
+            debug!(status, suspended, "the encoder did not take the suspend change");
+        } else {
+            debug!(suspended, "the encoder's output gate moved");
+        }
+    }
+
     /// Moves the codec to Executing (`AMediaCodec_start`).
     ///
     /// Must be called after the camera session has been given the input surface: an encoder

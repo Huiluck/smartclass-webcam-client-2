@@ -546,10 +546,14 @@ fn pump(setup: Setup, requests: Receiver<Command>, ready: SyncSender<Result<(), 
                 let _ = reply.send(outcome);
             }
             Ok(Command::SetEncoding { enabled }) => {
-                if enabled {
-                    // The core only turns encoding on when a stream is about to start, and a
-                    // stream that begins mid-GOP cannot be decoded until the next IDR.
-                    if let Some(stream) = pipeline.stream.as_mut() {
+                if let Some(stream) = pipeline.stream.as_mut() {
+                    // The codec stops producing output while no consumer reads it; the camera
+                    // keeps rendering into the encoder's surface either way, because the
+                    // session's outputs cannot change under a running request.
+                    stream.encoder.set_suspended(!enabled);
+                    if enabled {
+                        // A stream that starts now cannot decode until the next IDR, and the
+                        // resume itself may not have produced one.
                         stream.encoder.request_keyframe();
                     }
                 }
@@ -636,6 +640,11 @@ impl Stream {
             cfg.bitrate_kbps,
         )?;
         encoder.start()?;
+        // A fresh stream has no consumer: the core turns encoding on when a stream becomes
+        // active, and until then the codec only consumes what the camera renders into it. The
+        // camera has to keep rendering — the session's outputs are fixed — so this is the only
+        // way an idle pipeline does not pay for an encoder.
+        encoder.set_suspended(true);
 
         // The still output is best-effort: a device that cannot bring up a JPEG reader loses
         // `take_photo`, not the stream, and so does a camera that refuses to carry a still

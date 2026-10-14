@@ -1,6 +1,6 @@
 //! The live preview's image source: a `YUV_420_888` reader, its window riding in the capture
-//! session beside the encoder surface, and the conversion that turns its planes into the BGRA
-//! the core's preview path expects.
+//! session beside the encoder surface, and the conversion that turns its planes into the RGBA
+//! the core's preview path carries.
 //!
 //! # Why a third output
 //!
@@ -15,8 +15,17 @@
 //!
 //! A preview frame that is late is worthless — the next capture request is 16 ms away — so the
 //! reader never blocks and never queues. One frame is acquired per call and deleted right after
-//! the copy; when the camera has not finished a frame yet, the call reports nothing and the
+//! the conversion; when the camera has not finished a frame yet, the call reports nothing and the
 //! capture thread moves on. Frames the UI never consumed are dropped by the core, not here.
+//!
+//! # One pass, at the size the interface asked for
+//!
+//! The frame is converted exactly once: the camera's YUV planes are read where they lie — the
+//! image is alive for the whole of the conversion, so nothing is copied out of it — and written
+//! straight into RGBA at the size the consumer's box fits, turned by the sensor's orientation on
+//! the way. The size is fitted for the picture *as it will be shown*: a quarter turn swaps the
+//! source's sides before the fit, so the result is already the final frame and the core hands it
+//! on without a second pass over any pixel.
 
 use std::ptr;
 use std::slice;
@@ -56,8 +65,8 @@ pub(crate) struct PreviewCapture {
     reader: *mut AImageReader,
     /// The reader's window, borrowed until the reader is deleted.
     window: *mut ANativeWindow,
-    /// Reused BGRA output buffer, so a preview per frame does not allocate one.
-    bgra: Vec<u8>,
+    /// Reused RGBA output buffer, so a preview per frame does not allocate one.
+    rgba: Vec<u8>,
     /// Whether a conversion has ever produced a frame, for the one-time log.
     reported: bool,
     /// Clockwise degrees to turn the frame by before it is shown.
@@ -128,7 +137,7 @@ impl PreviewCapture {
         Ok(Self {
             reader,
             window,
-            bgra: Vec::new(),
+            rgba: Vec::new(),
             reported: false,
             rotation_degrees,
         })
@@ -141,7 +150,7 @@ impl PreviewCapture {
 
     /// Offers the newest frame the camera has written to the core's preview, if any.
     ///
-    /// Called once per capture-thread loop: it takes at most one frame, converts it to BGRA at
+    /// Called once per capture-thread loop: it takes at most one frame, converts it to RGBA at
     /// the size the preview asked for, and publishes it. Nothing is converted while the preview
     /// is off — [`scwc_core::preview::next_frame_size`] answers `None` and the frame is dropped
     /// unread, which is what keeps a preview nobody is watching from costing anything.
@@ -197,32 +206,47 @@ impl PreviewCapture {
         image
     }
 
-    /// Converts `image` to BGRA at the preview's size and publishes it; `false` when there is
+    /// Converts `image` to RGBA at the preview's size and publishes it; `false` when there is
     /// nothing to publish.
     fn convert_and_publish(&mut self, image: *mut AImage) -> Result<bool, CaptureError> {
         let (width, height) = image_size(image)?;
+        // The picture is turned before it is fitted, so the fitted size is computed from the
+        // shape the operator will see: a sensor mounted sideways reports its frame one way and
+        // the interface is the other. Fitting the *shown* shape makes the result the final
+        // frame — the core hands a frame of exactly that size on without rescaling it, which is
+        // what keeps the preview to one pass over the pixels.
+        let (source_width, source_height) = match self.rotation_degrees % 360 {
+            90 | 270 => (height, width),
+            _ => (width, height),
+        };
         let Some((out_width, out_height)) =
-            scwc_core::preview::next_frame_size(width, height)
+            scwc_core::preview::next_frame_size(source_width, source_height)
         else {
             // No preview is being watched, or the consumer is still behind its last frame.
             return Ok(false);
         };
 
-        let planes = Planes::read(image, width, height)?;
-        self.bgra.clear();
-        // The picture is turned before it is scaled, so the fitted size is computed from the
-        // shape the operator will see: a sensor mounted sideways reports its frame one way and
-        // the interface is the other.
-        let (shown_width, shown_height) = if self.rotation_degrees % 180 == 0 {
-            (out_width, out_height)
-        } else {
-            (out_height, out_width)
-        };
-        self.bgra
-            .resize(shown_width as usize * shown_height as usize * 4, 0);
-        planes.to_bgra(shown_width, shown_height, self.rotation_degrees, &mut self.bgra)?;
-        scwc_core::preview::publish_bgra(&self.bgra, shown_width, shown_height);
-        Ok(true)
+        self.rgba
+            .resize(out_width as usize * out_height as usize * 4, 0);
+        // SAFETY: the image is alive for the whole of this call — the caller deletes it only
+        // after this returns — and the conversion reads every byte it needs from the planes
+        // before that, which is why nothing is copied out of them here.
+        unsafe {
+            let planes = PlaneViews::read(image, width, height)?;
+            planes.to_rgba(
+                out_width,
+                out_height,
+                self.rotation_degrees,
+                &mut self.rgba,
+            )?;
+        }
+        // The frame is finished RGBA at exactly the size the consumer asked for: the core's
+        // only remaining work is handing it over.
+        Ok(scwc_core::preview::publish_rgba(
+            &self.rgba,
+            out_width,
+            out_height,
+        ))
     }
 }
 
@@ -277,7 +301,7 @@ fn image_size(image: *const AImage) -> Result<(u32, u32), CaptureError> {
 
 /// One plane of a YUV image: the bytes the platform points at, and how they are laid out.
 struct Plane<'a> {
-    /// The plane's rows.
+    /// The plane's bytes.
     data: &'a [u8],
     /// Bytes from one row to the next.
     row_stride: usize,
@@ -286,16 +310,6 @@ struct Plane<'a> {
 }
 
 impl Plane<'_> {
-    /// The sample at `(x, y)`.
-    fn sample(&self, x: usize, y: usize) -> u8 {
-        // Clamped rather than bounds-checked: a caller that walks with the plane's own strides
-        // can only land inside it, and clamping keeps a malformed stride from panicking on a
-        // capture thread — a frame the platform described oddly is skipped, not fatal.
-        let offset = y.min(self.rows().saturating_sub(1)) * self.row_stride
-            + x.min(self.columns().saturating_sub(1)) * self.pixel_stride;
-        self.data.get(offset).copied().unwrap_or(0)
-    }
-
     fn rows(&self) -> usize {
         if self.row_stride == 0 {
             0
@@ -313,50 +327,157 @@ impl Plane<'_> {
     }
 }
 
-/// The three planes of a YUV image, copied out of an acquired frame.
-struct Planes {
+/// A plane of a YUV image laid out for reading: the plane's bytes with the row and pixel strides
+/// already applied.
+///
+/// The conversion walks a plane once per frame and reads every pixel of it, so the two things a
+/// per-sample read must not do are recompute the plane's geometry and bounds-check: the strides
+/// are folded into `base`/`step` here, once, and the index is clamped against the plane's own
+/// length there. A plane whose geometry does not describe its bytes is refused rather than read
+/// out of range.
+struct PlaneView<'a> {
+    /// The plane's bytes.
+    data: &'a [u8],
+    /// Index of the sample at the plane's corner.
+    base: usize,
+    /// Bytes from one sample to the next within a row.
+    step: usize,
+    /// Bytes from the first sample of one row to the first of the next.
+    row_step: usize,
+}
+
+impl<'a> PlaneView<'a> {
+    /// Borrows a plane for reading, or `None` when its geometry cannot describe its bytes.
+    ///
+    /// A zero pixel stride would make every sample the same byte, and a row stride narrower than
+    /// the row it holds would make successive rows overlap, so the plane is walked with the
+    /// platform's own claim only when that claim is coherent; the YUV planes this backend reads
+    /// always carry a stride of at least one pixel.
+    fn new(plane: &Plane<'a>) -> Option<Self> {
+        let height = plane.rows();
+        let width = plane.columns();
+        if width == 0 || height == 0 || plane.pixel_stride == 0 || plane.row_stride == 0 {
+            return None;
+        }
+        let last = (height - 1) * plane.row_stride + (width - 1) * plane.pixel_stride;
+        if last >= plane.data.len() {
+            return None;
+        }
+        Some(Self {
+            data: plane.data,
+            base: 0,
+            step: plane.pixel_stride,
+            row_step: plane.row_stride,
+        })
+    }
+
+    /// The sample at `(x, y)` of the plane.
+    ///
+    /// The index is clamped into the plane rather than bounds-checked, so a caller that walks
+    /// with the plane's own strides cannot panic a capture thread on a frame the platform
+    /// described oddly; a read is then a single index into the slice.
+    #[inline]
+    fn at(&self, x: usize, y: usize) -> u8 {
+        let index = self.base + y * self.row_step + x * self.step;
+        self.data.get(index).copied().unwrap_or(0)
+    }
+}
+
+/// The three planes of a live YUV image, borrowed for one conversion.
+///
+/// The camera's buffers are only valid while the image is held, and the conversion runs while
+/// it is — the caller deletes the image after the frame is built — so the planes are borrowed
+/// where they lie instead of being copied out. A per-frame preview therefore allocates nothing
+/// on the way in.
+struct PlaneViews<'a> {
     /// Full-resolution luma, one byte per pixel.
-    y: PlaneData,
+    y: PlaneView<'a>,
     /// Quarter-resolution chroma.
-    u: PlaneData,
-    v: PlaneData,
+    u: PlaneView<'a>,
+    /// Quarter-resolution chroma.
+    v: PlaneView<'a>,
+    /// The image's pixel size.
     width: u32,
+    /// The image's pixel size.
     height: u32,
 }
 
-/// One plane's bytes and layout, owned so it outlives the image.
-struct PlaneData {
-    data: Vec<u8>,
-    row_stride: usize,
-    pixel_stride: usize,
-}
-
-impl Planes {
-    /// Copies the three planes out of a live image.
+impl<'a> PlaneViews<'a> {
+    /// Borrows the three planes of a live image.
     ///
-    /// The camera's buffers are only valid while the image is held, and the conversion happens
-    /// after the image is deleted, so the bytes are copied here rather than borrowed.
-    fn read(image: *const AImage, width: u32, height: u32) -> Result<Self, CaptureError> {
+    /// # Safety
+    ///
+    /// `image` must be live and the caller must keep it alive for as long as the returned views
+    /// are read: the planes point into the image's own buffers.
+    unsafe fn read(image: *const AImage, width: u32, height: u32) -> Result<Self, CaptureError> {
+        /// Borrows one plane of a live image.
+        ///
+        /// # Safety
+        ///
+        /// As [`PlaneViews::read`]: the image must outlive the returned view.
+        unsafe fn plane<'a>(image: *const AImage, index: i32) -> Result<PlaneView<'a>, CaptureError> {
+            let mut data: *mut u8 = ptr::null_mut();
+            let mut length: i32 = 0;
+            // SAFETY: the image is live for the caller's duration and both out pointers are locals.
+            let status = unsafe { AImage_getPlaneData(image, index, &mut data, &mut length) };
+            if status != AMEDIA_OK {
+                return Err(status_error("AImage_getPlaneData (preview)", status));
+            }
+            if data.is_null() || length <= 0 {
+                return Err(CaptureError::Os(format!(
+                    "the preview image's plane {index} carried no readable data"
+                )));
+            }
+            let mut row_stride: i32 = 0;
+            // SAFETY: as above.
+            let status = unsafe { AImage_getPlaneRowStride(image, index, &mut row_stride) };
+            if status != AMEDIA_OK {
+                return Err(status_error("AImage_getPlaneRowStride (preview)", status));
+            }
+            let mut pixel_stride: i32 = 0;
+            // SAFETY: as above.
+            let status = unsafe { AImage_getPlanePixelStride(image, index, &mut pixel_stride) };
+            if status != AMEDIA_OK {
+                return Err(status_error("AImage_getPlanePixelStride (preview)", status));
+            }
+            // SAFETY: the platform filled `data` with a pointer into the image's plane and
+            // `length` with its valid length in bytes; the image is alive for the whole of the
+            // borrow, which is what makes the range readable here.
+            let bytes = unsafe { slice::from_raw_parts(data, length as usize) };
+            let geometry = Plane {
+                data: bytes,
+                row_stride: row_stride.max(0) as usize,
+                pixel_stride: pixel_stride.max(0) as usize,
+            };
+            PlaneView::new(&geometry).ok_or_else(|| {
+                CaptureError::Os(format!(
+                    "the preview image's plane {index} has a geometry that cannot describe its bytes"
+                ))
+            })
+        }
+
         Ok(Self {
-            y: read_plane(image, 0)?,
-            u: read_plane(image, 1)?,
-            v: read_plane(image, 2)?,
+            // SAFETY: the image is live and owned by the caller for the whole borrow.
+            y: unsafe { plane(image, 0)? },
+            u: unsafe { plane(image, 1)? },
+            v: unsafe { plane(image, 2)? },
             width,
             height,
         })
     }
 
-    /// Converts to tightly packed BGRA at `out_width`x`out_height`, rotated by `rotation`, nearest-neighbour.
+    /// Converts to tightly packed RGBA at `out_width`x`out_height`, rotated by `rotation`.
     ///
-    /// The preview is scaled here rather than after the fact: a conversion pass per frame is
-    /// affordable, a second pass over the full-resolution picture is not. Chroma is sampled at
-    /// a quarter resolution, so the subsampling is done by index rather than by averaging —
-    /// the picture the operator gets is what the camera produced, at the size it was asked for.
+    /// This is the preview's only pass over the pixels: the colour conversion, the scale and the
+    /// turn happen together, and the channels are written in the order the consumer wants, so
+    /// neither an intermediate BGRA frame nor a second resample exists. Chroma is sampled at a
+    /// quarter resolution, so the subsampling is done by index rather than by averaging — the
+    /// picture the operator gets is what the camera produced, at the size it was asked for.
     ///
     /// `rotation` is the clockwise turn the sensor needs (0, 90, 180 or 270); the source is
     /// walked in the destination's order, so one pass both turns and scales and no intermediate
     /// frame is allocated.
-    fn to_bgra(
+    fn to_rgba(
         &self,
         out_width: u32,
         out_height: u32,
@@ -366,150 +487,128 @@ impl Planes {
         if self.width == 0 || self.height == 0 || out_width == 0 || out_height == 0 {
             return Err(CaptureError::UnsupportedParameters);
         }
-        let y = Plane {
-            data: &self.y.data,
-            row_stride: self.y.row_stride,
-            pixel_stride: self.y.pixel_stride,
-        };
-        let u = Plane {
-            data: &self.u.data,
-            row_stride: self.u.row_stride,
-            pixel_stride: self.u.pixel_stride,
-        };
-        let v = Plane {
-            data: &self.v.data,
-            row_stride: self.v.row_stride,
-            pixel_stride: self.v.pixel_stride,
-        };
 
-        // The frame before rotation, in the space the destination's coordinates map back into.
-        // A 90/270 turn swaps which destination axis comes from which source axis, so the
-        // pre-rotation destination box is the shown one with its sides exchanged.
-        let (pre_width, pre_height) = if rotation % 180 == 0 {
-            (out_width, out_height)
-        } else {
-            (out_height, out_width)
-        };
+        let (out_width, out_height) = (out_width as usize, out_height as usize);
         let (source_width, source_height) = (self.width as usize, self.height as usize);
+        let quarter = rotation % 360;
 
-        for row in 0..out_height as usize {
-            for column in 0..out_width as usize {
-                // Where this destination pixel sits in the unrotated frame.
-                let (pre_x, pre_y) = match rotation % 360 {
-                    90 => (row * pre_width as usize / out_height as usize, (out_width as usize - 1 - column) * pre_height as usize / out_width as usize),
+        // Every source coordinate is a ratio of a destination coordinate, and the same ratio
+        // serves a whole row or column, so the maps are built once per frame instead of being
+        // recomputed per pixel: the inner loop then only indexes them. Two maps per axis are
+        // enough, because each of the four turns takes its source coordinate from one of them.
+        let source_x_of_row: Vec<usize> = (0..out_height)
+            .map(|row| row * source_width / out_height)
+            .collect();
+        let source_y_of_row: Vec<usize> = (0..out_height)
+            .map(|row| row * source_height / out_height)
+            .collect();
+        let source_x_of_column: Vec<usize> = (0..out_width)
+            .map(|column| column * source_width / out_width)
+            .collect();
+        let source_y_of_column: Vec<usize> = (0..out_width)
+            .map(|column| column * source_height / out_width)
+            .collect();
+
+        for row in 0..out_height {
+            // The source row this destination row reads, per turn. A 90/270 turn takes its
+            // source row from the destination column and vice versa, which is the whole of what
+            // a turn does to the address.
+            let base = row * out_width * 4;
+            let row_x = source_x_of_row[row];
+            let row_y = source_y_of_row[row];
+            let row_y_flipped = source_y_of_row[out_height - 1 - row];
+            let row_x_flipped = source_x_of_row[out_height - 1 - row];
+            for column in 0..out_width {
+                let (source_x, source_y) = match quarter {
+                    90 => (row_x, source_y_of_column[out_width - 1 - column]),
                     180 => (
-                        (out_width as usize - 1 - column) * pre_width as usize / out_width as usize,
-                        (out_height as usize - 1 - row) * pre_height as usize / out_height as usize,
+                        source_x_of_column[out_width - 1 - column],
+                        row_y_flipped,
                     ),
-                    270 => (
-                        (out_height as usize - 1 - row) * pre_width as usize / out_height as usize,
-                        column * pre_height as usize / out_width as usize,
-                    ),
+                    270 => (row_x_flipped, source_y_of_column[column]),
                     // 0, and anything malformed, which is drawn as it came.
-                    _ => (
-                        column * pre_width as usize / out_width as usize,
-                        row * pre_height as usize / out_height as usize,
-                    ),
+                    _ => (source_x_of_column[column], row_y),
                 };
-
-                let source_x = pre_x * source_width / pre_width as usize;
-                let source_y = pre_y * source_height / pre_height as usize;
-                let luma = y.sample(source_x, source_y) as f32;
                 // Chroma planes are half the size in both directions.
                 let chroma_x = source_x / 2;
                 let chroma_y = source_y / 2;
-                let cb = u.sample(chroma_x, chroma_y) as f32 - 128.0;
-                let cr = v.sample(chroma_x, chroma_y) as f32 - 128.0;
 
-                // The BT.601 full-range conversion, which is what `YUV_420_888` carries.
-                let r = luma + 1.402 * cr;
-                let g = luma - 0.344_136 * cb - 0.714_136 * cr;
-                let b = luma + 1.772 * cb;
+                let luma = i32::from(self.y.at(source_x, source_y));
+                let cb = i32::from(self.u.at(chroma_x, chroma_y)) - 128;
+                let cr = i32::from(self.v.at(chroma_x, chroma_y)) - 128;
 
-                let base = (row * out_width as usize + column) * 4;
-                out[base] = clamp(b);
-                out[base + 1] = clamp(g);
-                out[base + 2] = clamp(r);
-                out[base + 3] = 0xFF;
+                let pixel = base + column * 4;
+                out[pixel] = clamp_bg((luma << SHIFT) + R_CR * cr);
+                out[pixel + 1] = clamp_bg((luma << SHIFT) - G_CB * cb - G_CR * cr);
+                out[pixel + 2] = clamp_bg((luma << SHIFT) + B_CB * cb);
+                out[pixel + 3] = u8::MAX;
             }
         }
         Ok(())
     }
 }
 
-/// Rounds a colour component to a byte.
-fn clamp(value: f32) -> u8 {
-    value.clamp(0.0, 255.0).round() as u8
-}
+/// The BT.601 full-range conversion, which is what `YUV_420_888` carries, in fixed point so the
+/// inner loop is integer arithmetic. The factors are 1.402, 0.344136, 0.714136 and 1.772, scaled
+/// by 2^[`SHIFT`] and rounded to the nearest integer.
+const R_CR: i32 = 91_880;
+/// Green's chroma-blue factor.
+const G_CB: i32 = 22_554;
+/// Green's chroma-red factor.
+const G_CR: i32 = 46_803;
+/// Blue's chroma-blue factor.
+const B_CB: i32 = 116_131;
+/// Bit shift the colour components are scaled by.
+const SHIFT: u32 = 16;
+/// Rounding bias for [`SHIFT`].
+const HALF: i32 = 1 << (SHIFT - 1);
 
-/// Copies one plane of an acquired image out.
-fn read_plane(image: *const AImage, index: i32) -> Result<PlaneData, CaptureError> {
-    let mut data: *mut u8 = ptr::null_mut();
-    let mut length: i32 = 0;
-    // SAFETY: the image is live for the caller's duration and both out pointers are locals.
-    let status = unsafe { AImage_getPlaneData(image, index, &mut data, &mut length) };
-    if status != AMEDIA_OK {
-        return Err(status_error("AImage_getPlaneData (preview)", status));
-    }
-    if data.is_null() || length <= 0 {
-        return Err(CaptureError::Os(format!(
-            "the preview image's plane {index} carried no readable data"
-        )));
-    }
-
-    let mut row_stride: i32 = 0;
-    // SAFETY: as above.
-    let status = unsafe { AImage_getPlaneRowStride(image, index, &mut row_stride) };
-    if status != AMEDIA_OK {
-        return Err(status_error("AImage_getPlaneRowStride", status));
-    }
-    let mut pixel_stride: i32 = 0;
-    // SAFETY: as above.
-    let status = unsafe { AImage_getPlanePixelStride(image, index, &mut pixel_stride) };
-    if status != AMEDIA_OK {
-        return Err(status_error("AImage_getPlanePixelStride", status));
-    }
-
-    // SAFETY: the platform filled `data` with a pointer into the image's plane and `length`
-    // with its valid length in bytes; the image is still alive, so the range is readable for
-    // this call, and the bytes are copied out before it is deleted.
-    let bytes = unsafe { slice::from_raw_parts(data, length as usize) };
-    Ok(PlaneData {
-        data: bytes.to_vec(),
-        row_stride: row_stride.max(0) as usize,
-        pixel_stride: pixel_stride.max(0) as usize,
-    })
+/// Rounds one fixed-point colour component to a byte.
+#[inline]
+fn clamp_bg(scaled: i32) -> u8 {
+    (((scaled + HALF) >> SHIFT).clamp(0, 255)) as u8
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// One Y plane plus neutral chroma, so the conversion is a pure luma pass.
-    fn planes(width: u32, height: u32, luma: impl Fn(u32, u32) -> u8) -> Planes {
+    /// Borrows the three planes of a frame that is already in memory, the way
+    /// [`PlaneViews::read`] borrows them out of a live image.
+    fn views(width: u32, height: u32, luma: impl Fn(u32, u32) -> u8) -> PlaneViews<'static> {
         let mut y = Vec::with_capacity((width * height) as usize);
         for row in 0..height {
             for column in 0..width {
                 y.push(luma(column, row));
             }
         }
-        Planes {
-            y: PlaneData {
+        // The Y plane is walked with the source's own strides, and building it row-major with
+        // a stride of one pixel per sample is what `AImage_getPlaneRowStride` reports for the
+        // planes this backend reads on the devices it was developed on.
+        let u = vec![128u8; (width * height / 4) as usize];
+        let v = vec![128u8; (width * height / 4) as usize];
+        let y: &'static [u8] = Box::leak(y.into_boxed_slice());
+        let u: &'static [u8] = Box::leak(u.into_boxed_slice());
+        let v: &'static [u8] = Box::leak(v.into_boxed_slice());
+        PlaneViews {
+            y: PlaneView::new(&Plane {
                 data: y,
                 row_stride: width as usize,
                 pixel_stride: 1,
-            },
-            // 128 in both chroma planes is neutral grey, so every output colour is the luma.
-            u: PlaneData {
-                data: vec![128; (width * height / 4) as usize],
+            })
+            .expect("y plane"),
+            u: PlaneView::new(&Plane {
+                data: u,
                 row_stride: (width / 2) as usize,
                 pixel_stride: 1,
-            },
-            v: PlaneData {
-                data: vec![128; (width * height / 4) as usize],
+            })
+            .expect("u plane"),
+            v: PlaneView::new(&Plane {
+                data: v,
                 row_stride: (width / 2) as usize,
                 pixel_stride: 1,
-            },
+            })
+            .expect("v plane"),
             width,
             height,
         }
@@ -518,7 +617,7 @@ mod tests {
     fn convert(width: u32, height: u32, rotation: u16) -> (Vec<u8>, u32, u32) {
         // A marker in the top-left and a different one in the top-right, so a turn is visible
         // in the output regardless of scaling.
-        let source = planes(width, height, |x, y| {
+        let source = views(width, height, |x, y| {
             if y < height / 2 && x < width / 2 {
                 255
             } else if y < height / 2 {
@@ -531,63 +630,77 @@ mod tests {
         });
         let mut out = vec![0u8; (width * height * 4) as usize];
         source
-            .to_bgra(width, height, rotation, &mut out)
+            .to_rgba(width, height, rotation, &mut out)
             .expect("conversion succeeds");
         (out, width, height)
     }
 
-    fn luma_at(out: &[u8], width: u32, x: u32, y: u32) -> u8 {
-        out[((y * width + x) * 4) as usize + 2]
+    /// The red channel of one output pixel: with neutral chroma the red of a luma `l` is `l`,
+    /// so the marker values come through unchanged.
+    fn red_at(out: &[u8], width: u32, x: u32, y: u32) -> u8 {
+        out[((y * width + x) * 4) as usize]
     }
 
     #[test]
     fn a_zero_rotation_leaves_the_frame_as_it_came() {
         let (out, width, _) = convert(8, 8, 0);
-        assert_eq!(luma_at(&out, width, 1, 1), 255, "top-left stays top-left");
-        assert_eq!(luma_at(&out, width, 6, 1), 64, "top-right stays top-right");
-        assert_eq!(luma_at(&out, width, 1, 6), 32);
-        assert_eq!(luma_at(&out, width, 6, 6), 0);
+        assert_eq!(red_at(&out, width, 1, 1), 255, "top-left stays top-left");
+        assert_eq!(red_at(&out, width, 6, 1), 64, "top-right stays top-right");
+        assert_eq!(red_at(&out, width, 1, 6), 32);
+        assert_eq!(red_at(&out, width, 6, 6), 0);
     }
 
     #[test]
     fn a_quarter_turn_moves_the_top_left_corner_to_the_top_right() {
         // Turning clockwise: the source's top-left lands at the destination's top-right.
         let (out, width, _) = convert(8, 8, 90);
-        assert_eq!(luma_at(&out, width, 6, 1), 255, "source top-left → top-right");
-        assert_eq!(luma_at(&out, width, 6, 6), 64, "source top-right → bottom-right");
-        assert_eq!(luma_at(&out, width, 1, 1), 32, "source bottom-left → top-left");
-        assert_eq!(luma_at(&out, width, 1, 6), 0);
+        assert_eq!(red_at(&out, width, 6, 1), 255, "source top-left → top-right");
+        assert_eq!(red_at(&out, width, 6, 6), 64, "source top-right → bottom-right");
+        assert_eq!(red_at(&out, width, 1, 1), 32, "source bottom-left → top-left");
+        assert_eq!(red_at(&out, width, 1, 6), 0);
     }
 
     #[test]
     fn a_half_turn_moves_the_corner_diagonally() {
         let (out, width, _) = convert(8, 8, 180);
-        assert_eq!(luma_at(&out, width, 6, 6), 255, "top-left → bottom-right");
-        assert_eq!(luma_at(&out, width, 1, 6), 64);
-        assert_eq!(luma_at(&out, width, 6, 1), 32);
-        assert_eq!(luma_at(&out, width, 1, 1), 0);
+        assert_eq!(red_at(&out, width, 6, 6), 255, "top-left → bottom-right");
+        assert_eq!(red_at(&out, width, 1, 6), 64);
+        assert_eq!(red_at(&out, width, 6, 1), 32);
+        assert_eq!(red_at(&out, width, 1, 1), 0);
     }
 
     #[test]
     fn a_three_quarter_turn_moves_the_top_left_corner_to_the_bottom_left() {
         let (out, width, _) = convert(8, 8, 270);
-        assert_eq!(luma_at(&out, width, 1, 6), 255, "source top-left → bottom-left");
-        assert_eq!(luma_at(&out, width, 1, 1), 64);
-        assert_eq!(luma_at(&out, width, 6, 6), 32);
-        assert_eq!(luma_at(&out, width, 6, 1), 0);
+        assert_eq!(red_at(&out, width, 1, 6), 255, "source top-left → bottom-left");
+        assert_eq!(red_at(&out, width, 1, 1), 64);
+        assert_eq!(red_at(&out, width, 6, 6), 32);
+        assert_eq!(red_at(&out, width, 6, 1), 0);
     }
 
     #[test]
     fn a_quarter_turn_swaps_the_side_lengths() {
         // A wide source turned a quarter stands tall: the destination is the source's shape
         // transposed, which is what keeps a landscape sensor's picture filling a portrait box.
-        let source = planes(16, 4, |_, _| 128);
+        let source = views(16, 4, |_, _| 128);
         let mut out = vec![0u8; 16 * 4 * 4];
         // 4 wide by 16 tall, i.e. the source's sides exchanged at the same pixel count.
         source
-            .to_bgra(4, 16, 90, &mut out)
+            .to_rgba(4, 16, 90, &mut out)
             .expect("conversion succeeds");
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn alpha_is_opaque_and_chroma_of_128_is_a_pure_luma_pass() {
+        let source = views(4, 4, |x, y| (x + y) as u8 * 30);
+        let mut out = vec![0u8; 4 * 4 * 4];
+        source.to_rgba(4, 4, 0, &mut out).expect("conversion succeeds");
+        for pixel in 0..16 {
+            let y = (pixel / 4 + pixel % 4) as u8 * 30;
+            assert_eq!(&out[pixel * 4..pixel * 4 + 3], &[y, y, y]);
+            assert_eq!(out[pixel * 4 + 3], u8::MAX, "a camera picture has no transparency");
+        }
     }
 
     #[test]
