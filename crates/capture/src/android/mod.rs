@@ -62,6 +62,9 @@ mod image_reader;
 mod media;
 mod native_window;
 mod preview;
+// `pub(crate)` because the crate root re-exports this module's five entry points for the app's
+// plugin: a path through two private modules is not one `pub use` can name.
+pub(crate) mod preview_surface;
 mod session;
 mod still;
 
@@ -74,6 +77,7 @@ use scwc_protocol::Codec;
 use tracing::{debug, error, info, warn};
 
 use self::camera2::{ACameraDevice_StateCallbacks, LensFacing, Manager, Metadata};
+use self::native_window::ANativeWindow;
 use self::preview::PreviewCapture;
 use self::still::StillCapture;
 use crate::camera_matrix::{fps_by_resolution, fps_ranges};
@@ -614,6 +618,15 @@ struct Stream {
     /// The running capture session.
     #[allow(dead_code)]
     session: session::Session,
+    /// The interface's own preview window, while this session renders into it.
+    ///
+    /// Placed after `session` on purpose: the session's outputs are what reference the window,
+    /// and they are freed by `Session`'s `Drop` before the reference this holds goes.
+    ///
+    /// Never read: the lease is kept for what it owns — one reference on the window, given back
+    /// when this stream is dropped and not before.
+    #[allow(dead_code)]
+    external: Option<preview_surface::Lease>,
     /// The hardware encoder the session fills.
     encoder: media::Encoder,
     /// The JPEG reader `take_photo` reads from, when the camera accepted one.
@@ -623,7 +636,11 @@ struct Stream {
 }
 
 impl Stream {
-    /// Brings up the chain: encoder, still reader, preview reader, session.
+    /// Brings up the chain: encoder, still reader, preview, session.
+    ///
+    /// The preview is the interface's own window when it handed one over, and a YUV reader of
+    /// this backend's otherwise — see [`Self::start_session`] for the order the outputs are
+    /// surrendered in.
     fn start(
         device: &mut camera2::Device,
         cfg: &CaptureConfig,
@@ -657,72 +674,140 @@ impl Stream {
             }
         };
         // The preview output is best-effort for the same reason: a camera that will not carry a
-        // third output loses the interface's picture, not the stream. The frames are only read
-        // while the UI is showing a preview, so the output costs a session combination, not a
-        // conversion, when nothing is watching.
-        let mut preview = match PreviewCapture::new(
-            cfg.width,
-            cfg.height,
-            rotation_degrees(&characteristics),
-        ) {
-            Ok(preview) => Some(preview),
-            Err(error) => {
-                warn!(%error, "no preview output for this Android stream; the preview will stay empty");
-                None
-            }
-        };
-        let still_window = still.as_ref().map(StillCapture::window);
-        let preview_window = preview.as_ref().map(PreviewCapture::window);
-        let session = match session::Session::start(
-            device,
-            encoder.input_surface(),
-            still_window,
-            preview_window,
-            cfg.fps,
-        ) {
-            Ok(session) => session,
-            // A camera may refuse the combination of outputs while accepting a subset of them,
-            // and the stream is the thing that must survive: the preview goes first, then the
-            // still, and the encoder alone is the combination every camera carries.
-            Err(error) if preview_window.is_some() => {
-                warn!(%error, "the camera refused the preview output; rebuilding the session without it");
-                preview = None;
-                match session::Session::start(
-                    device,
-                    encoder.input_surface(),
-                    still_window,
-                    None,
-                    cfg.fps,
-                ) {
-                    Ok(session) => session,
-                    Err(error) if still_window.is_some() => {
-                        warn!(%error, "the camera refused the still output too; rebuilding the session with the encoder alone");
-                        still = None;
-                        session::Session::start(
-                            device,
-                            encoder.input_surface(),
-                            None,
-                            None,
-                            cfg.fps,
-                        )?
+        // third output loses the interface's picture, not the stream.
+        //
+        // The interface's own window, when it handed one over, comes first: the camera renders
+        // into it with every capture request, so the picture costs no conversion, no copy and no
+        // per-frame work at all — the engine owns the texture and the notice that a newer frame
+        // is waiting. The reader below is the fallback, and stays the only path while the
+        // interface handed over no window.
+        let rotation = rotation_degrees(&characteristics);
+        let mut external = match preview_surface::lease() {
+            Some(mut lease) => {
+                // The size the camera renders at is the reader's cap and shape: the window is a
+                // preview like any other, and a larger one would only cost camera bandwidth.
+                let (width, height) = preview::preview_size(cfg.width, cfg.height);
+                match lease.set_size(width, height) {
+                    Ok(()) => Some(lease),
+                    Err(error) => {
+                        warn!(%error, width, height, "the interface's preview window will not take this size; the preview will come from a YUV reader");
+                        None
                     }
-                    Err(error) => return Err(error),
                 }
             }
-            Err(error) if still_window.is_some() => {
-                warn!(%error, "the camera refused the still output; rebuilding the session without it");
-                still = None;
-                session::Session::start(device, encoder.input_surface(), None, None, cfg.fps)?
-            }
-            Err(error) => return Err(error),
+            None => None,
         };
+        let mut preview = if external.is_some() {
+            // The session carries one preview output; a camera that is already rendering into
+            // the interface's window has no need of a reader, and asking for both is a
+            // combination far more cameras refuse.
+            None
+        } else {
+            match PreviewCapture::new(cfg.width, cfg.height, rotation) {
+                Ok(preview) => Some(preview),
+                Err(error) => {
+                    warn!(%error, "no preview output for this Android stream; the preview will stay empty");
+                    None
+                }
+            }
+        };
+
+        let session = Self::start_session(
+            device,
+            encoder.input_surface(),
+            &mut external,
+            &mut preview,
+            &mut still,
+            cfg.fps,
+        )?;
+
+        // Which of the two the picture comes from is what a run's log has to answer: the two
+        // paths cost nothing alike, and only one of them is the interface's own texture.
+        preview_surface::set_rotation(rotation);
+        preview_surface::set_active(external.is_some());
+        if external.is_some() {
+            info!("the Android preview is rendering into the interface's own texture");
+        } else if preview.is_some() {
+            info!("the Android preview is converting YUV frames");
+        } else {
+            warn!("the Android stream carries no preview output at all");
+        }
 
         Ok(Self {
             session,
+            external,
             encoder,
             still,
             preview,
         })
+    }
+
+    /// One attempt at the session, with whichever of the three optional outputs the caller still
+    /// holds.
+    ///
+    /// The preview window is the interface's own while it holds one, and the reader's otherwise:
+    /// a session carries one preview output, and it is named by whichever the stream kept.
+    fn try_session(
+        device: &mut camera2::Device,
+        surface: *mut ANativeWindow,
+        external: &Option<preview_surface::Lease>,
+        preview: &Option<PreviewCapture>,
+        still: &Option<StillCapture>,
+        fps: u32,
+    ) -> Result<session::Session, CaptureError> {
+        session::Session::start(
+            device,
+            surface,
+            still.as_ref().map(StillCapture::window),
+            external
+                .as_ref()
+                .map(preview_surface::Lease::window)
+                .or_else(|| preview.as_ref().map(PreviewCapture::window)),
+            fps,
+        )
+    }
+
+    /// Brings the session up, surrendering the outputs the camera refuses one at a time.
+    ///
+    /// A camera may refuse the combination of outputs while accepting a subset of them, and the
+    /// stream is the thing that must survive. The order is fixed: the preview first — the
+    /// interface's window before a reader of our own — then the still, and the encoder alone is
+    /// the combination every camera carries. `external`, `preview` and `still` are left holding
+    /// whatever the camera accepted, so the stream's fields describe the session it runs on.
+    fn start_session(
+        device: &mut camera2::Device,
+        surface: *mut ANativeWindow,
+        external: &mut Option<preview_surface::Lease>,
+        preview: &mut Option<PreviewCapture>,
+        still: &mut Option<StillCapture>,
+        fps: u32,
+    ) -> Result<session::Session, CaptureError> {
+        let mut attempt = Self::try_session(device, surface, external, preview, still, fps);
+        if let Err(error) = attempt {
+            if external.take().is_some() {
+                warn!(%error, "the camera refused the interface's preview window; trying a YUV reader");
+                attempt = Self::try_session(device, surface, external, preview, still, fps);
+            } else {
+                attempt = Err(error);
+            }
+        }
+        if let Err(error) = attempt {
+            if preview.take().is_some() {
+                warn!(%error, "the camera refused the preview output; rebuilding the session without it");
+                attempt = Self::try_session(device, surface, external, preview, still, fps);
+            } else {
+                attempt = Err(error);
+            }
+        }
+        if let Err(error) = attempt {
+            if still.take().is_some() {
+                warn!(%error, "the camera refused the still output too; rebuilding the session with the encoder alone");
+                attempt = Self::try_session(device, surface, external, preview, still, fps);
+            } else {
+                attempt = Err(error);
+            }
+        }
+        attempt
     }
 }
 

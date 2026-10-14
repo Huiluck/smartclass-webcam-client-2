@@ -155,6 +155,18 @@ pub use crate::error::CaptureError;
 pub use crate::source::{CaptureSource, open};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use crate::source::{release_frame_buffer, retain_frame_buffer};
+/// The interface's own preview window, on the one platform that has one.
+///
+/// On Android the embedding application can hand a `Surface` over for the camera to render into,
+/// which is what makes a preview cost nothing per frame; these are the entry points its plugin
+/// calls. The window is a native object, so it stays in the Android module rather than in the
+/// core: nothing outside this crate names it.
+#[cfg(target_os = "android")]
+pub use crate::android::preview_surface::{
+    active as preview_external_active, attach as preview_attach_surface,
+    detach as preview_detach_surface, rotation as preview_rotation_degrees,
+    size as preview_size_pixels,
+};
 
 /// Lists the cameras of the host.
 ///

@@ -265,12 +265,15 @@ impl Drop for PreviewCapture {
 // is only handed back to that same thread's session.
 unsafe impl Send for PreviewCapture {}
 
-/// The size the preview reader is created at: `width`x`height` capped to [`MAX_PREVIEW_WIDTH`].
+/// The size a preview output is created at: `width`x`height` capped to [`MAX_PREVIEW_WIDTH`].
+///
+/// Shared by the reader this backend makes and by the interface's own window, which is a preview
+/// like any other: both want the camera's shape at no more than the pixels a picture can show.
 ///
 /// Keeps the picture's shape while it shrinks it, so the frame the core scales to the UI box
 /// keeps the camera's aspect ratio. Sizes the camera would not accept are rounded down to even
 /// numbers, which every YUV output requires.
-fn preview_size(width: u32, height: u32) -> (u32, u32) {
+pub(crate) fn preview_size(width: u32, height: u32) -> (u32, u32) {
     if width <= MAX_PREVIEW_WIDTH {
         return (width & !1, height & !1);
     }

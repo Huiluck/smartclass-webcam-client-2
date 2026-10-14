@@ -654,7 +654,9 @@ mod tests {
         let rgba = [0u8; 8 * 4 * 4];
         assert!(!publish_rgba(&rgba, 8, 4), "no box, no frame");
 
-        let (_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        // A sender that is dropped at once: the point is that a texture-less, sink-less preview
+        // is no consumer, whichever way the frame arrives.
+        let (_sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<PreviewFrame>();
         set_preview_target_size(8, 8);
         // No sink and no texture is no consumer, whatever the frame is.
         assert!(!publish_rgba(&rgba, 8, 4), "no consumer, no frame");
