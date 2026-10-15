@@ -132,6 +132,7 @@ dist/
 .env.*
 !.env.example
 
-# Local cross-compile toolchain (.cargo/config.toml holds absolute NDK paths, which are
-# per-machine; CI sets the same values through the environment instead — see build.yml).
-.cargo/config.toml
+# The cross-compile toolchain the local host names. `.cargo/config.toml` holds absolute NDK
+# paths (per-machine) and `.cargo/config.toml.example` is its template; CI names the toolchain
+# through the environment instead — see the android job in build.yml. Nothing here ships.
+.cargo/
