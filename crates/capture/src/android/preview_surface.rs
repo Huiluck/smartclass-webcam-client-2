@@ -153,13 +153,24 @@ pub fn rotation() -> u16 {
     ROTATION.load(Ordering::Acquire)
 }
 
-/// The size the camera renders into the application's window, or `None` while none has been set.
+/// The size of the picture the interface shows, or `None` while none has been rendered yet.
 ///
-/// The size the platform reports back rather than the one that was asked for: windows round.
+/// The size the platform reports back rather than the one that was asked for: windows round. It
+/// is the *shown* size — the buffer's sides exchanged when the sensor needs a quarter turn —
+/// because the picture the engine samples out of the texture is already upright: the camera
+/// writes its sensor's own orientation into the window, the buffer's transform matrix turns it
+/// back, and what the interface sees is the turned picture. Reporting the buffer's own sides
+/// here would have the interface letterbox a portrait picture in a landscape box.
 pub fn size() -> Option<(u32, u32)> {
     let width = WIDTH.load(Ordering::Acquire);
     let height = HEIGHT.load(Ordering::Acquire);
-    (width > 0 && height > 0).then_some((width, height))
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(match rotation() {
+        90 | 270 => (height, width),
+        _ => (width, height),
+    })
 }
 
 /// One stream's use of the application's window.

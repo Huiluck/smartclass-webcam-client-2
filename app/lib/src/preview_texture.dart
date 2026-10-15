@@ -93,16 +93,24 @@ class PreviewTexture {
     }
   }
 
-  /// The clockwise quarter turns the platform's picture needs to stand up: 0, 1, 2 or 3, or `null`
-  /// while the platform does not paint or has not answered yet.
+  /// The clockwise quarter turns the interface still has to turn the platform's picture by: 0,
+  /// 1, 2 or 3, or `null` while the platform does not paint or has not answered yet.
   ///
-  /// Android's camera writes its sensor's own orientation into the texture, and a sensor's
-  /// orientation is a property of the camera rather than something its buffers carry — so the
-  /// interface is told it instead of reading it out of a frame. Everywhere else the picture is
-  /// already upright, and the answer is 0.
+  /// Zero on Android, and that is not an oversight: the camera renders into a `SurfaceTexture`,
+  /// and the engine samples that texture with the buffer's own transform matrix, which already
+  /// accounts for the sensor's orientation — the picture arrives upright. Turning it here as
+  /// well is what makes a portrait preview show a landscape picture: the correction is applied
+  /// twice, and the second one is a quarter turn clockwise that has nothing to correct.
+  ///
+  /// The platform still reports the sensor's own orientation through `rotation`, and it is worth
+  /// reading in a log: a device whose camera service does not fill that transform matrix in is a
+  /// device on which this has to be the sensor's quarter turns instead of zero.
   static Future<int?> quarterTurns() async {
     if (!available) {
       return null;
+    }
+    if (Platform.isAndroid) {
+      return 0;
     }
     try {
       final degrees = await _channel.invokeMethod<int>('rotation');

@@ -137,3 +137,15 @@ stream 无 box → 黑屏）。
 dart 全部不可用。已做：rustc 解析级检查（改动区无错）+ 文件结构配平。**待 Windows 主机重启后**：
 `cargo check --target aarch64-linux-android -p scwc-capture`、`cargo test`、`flutter build apk`
 （唯一能证明 NDK 符号链接的一步）、adb 联调 + 帧率实测（dumpsys media.camera 30s 增量 ≥1650 帧）。
+
+### R4 真机行为修正（2026-10-14 20:40）
+卡顿已解决。新问题：竖屏预览显示横屏画面（内容被多转一次顺时针 90°）。
+根因：camera2 写入 SurfaceTexture 的缓冲**自带 transform 矩阵，引擎采样时已把传感器方向修正**，
+到达 Dart 的画面已正立；`RotatedBox(quarterTurns=1)` 又补一次 → 双重修正。
+两处改动：
+1. `app/lib/src/preview_texture.dart` `quarterTurns()` 对 Android 返回 0（机制保留，注释说明
+   "设备若不填 transform 矩阵则需改回传感器 quarter turns"）；
+2. `crates/capture/src/android/preview_surface.rs` `size()` 上报**转向后**尺寸（90/270 换边），
+   否则 `AspectRatio` 仍是横屏盒子。
+**教训**：Android SurfaceTexture 路径**不需要**再做传感器旋转补偿；像素路径
+（`to_rgba` 的 90 分支）需要。两者方向语义不同，别照搬。

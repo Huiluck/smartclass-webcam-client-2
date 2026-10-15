@@ -1,6 +1,7 @@
 # Agent tooling
 .orca/
 .omp/
+.workbuddy-ai/
 
 # E2E harness cache (downloaded server source/binary, PostgreSQL, run state, media)
 .cache/
