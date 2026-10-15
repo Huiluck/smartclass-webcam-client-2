@@ -180,6 +180,14 @@ jobs:
       - name: Check the capture crate (aarch64-linux-android)
         run: cargo check -p scwc-capture --target aarch64-linux-android --locked
 
+      - name: Install VAAPI (the host tests link against it)
+        # The workspace's examples and the capture crate's own Linux backend link `-lva` and
+        # `-lva-drm` when they are built for a Linux host, which is what a host test run builds.
+        # The linux-windows job installs the same package for the same reason.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libva-dev
+
       - name: Unit tests (Linux host)
         run: cargo test --workspace --exclude scwc-e2e --locked
 
