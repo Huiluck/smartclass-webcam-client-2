@@ -1,11 +1,20 @@
 # Cross-compiling for Android from a Windows host: the toolchain cargo cannot guess.
 #
-# The Gradle build does not need this — cargokit sets the same values itself when it builds
-# `librust_lib.so` — but a hand-run `cargo check --target aarch64-linux-android -p scwc-capture`
-# does: without a C compiler for the target, `ring`'s build script stops the whole check.
+# This file is a template, and it is not tracked. Copy it to `config.toml` in this directory
+# (gitignored, because the paths are absolute and per-machine) to make a hand-run
+# `cargo check --target aarch64-linux-android -p scwc-capture` work. CI does not use it — the
+# android job in `.github/workflows/build.yml` sets the same values through the environment, and
+# removes this file if it happens to be present, because the absolute paths below are wrong on a
+# Linux runner.
+#
+# The Gradle build never needs this: cargokit sets the same values itself when it builds
+# `librust_lib.so` for the APK. Only a bare cargo invocation needs it.
 #
 # The NDK's per-ABI wrappers (`aarch64-linux-android21-clang`) have no extension on Windows and
 # cannot be executed, so the generic `clang.exe` is used with an explicit `--target` instead.
+#
+# On macOS or Linux use the NDK's `toolchains/llvm/prebuilt/<host>/bin` directory instead, with
+# `aarch64-linux-android21-clang` as the compiler — there the wrapper is executable.
 [target.aarch64-linux-android]
 linker = "C:/Users/Lhui/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/bin/clang++.exe"
 rustflags = ["-C", "link-arg=--target=aarch64-linux-android21"]

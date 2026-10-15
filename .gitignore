@@ -131,3 +131,7 @@ dist/
 .env
 .env.*
 !.env.example
+
+# Local cross-compile toolchain (.cargo/config.toml holds absolute NDK paths, which are
+# per-machine; CI sets the same values through the environment instead — see build.yml).
+.cargo/config.toml
